@@ -769,6 +769,7 @@ dependencies = [
 name = "indextts-ort"
 version = "0.1.0"
 dependencies = [
+ "candle-core",
  "indextts-core",
  "ndarray 0.16.1",
  "once_cell",

@@ -226,6 +226,53 @@ pub fn run_wav2vec2bert(session: &OnnxSession, features: Tensor, mask: Tensor) -
     )?.into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing Wav2Vec2-BERT output".into()))
 }
 
+#[derive(Debug, Clone)]
+pub struct Wav2VecStats {
+    mean: Vec<f32>,
+    inverse_std: Vec<f32>,
+}
+
+impl Wav2VecStats {
+    pub fn load(path: &Path) -> Result<Self> {
+        let tensors = candle_core::safetensors::load(path, &candle_core::Device::Cpu)
+            .map_err(|error| IndexTtsError::InvalidModel(format!(
+                "failed to load Wav2Vec statistics {}: {error}", path.display()
+            )))?;
+        let mean = tensors.get("mean").ok_or_else(|| {
+            IndexTtsError::InvalidModel("Wav2Vec statistics missing mean".into())
+        })?.to_vec1::<f32>().map_err(|error| IndexTtsError::InvalidModel(error.to_string()))?;
+        let variance = tensors.get("var").ok_or_else(|| {
+            IndexTtsError::InvalidModel("Wav2Vec statistics missing var".into())
+        })?.to_vec1::<f32>().map_err(|error| IndexTtsError::InvalidModel(error.to_string()))?;
+        if mean.len() != 1024 || variance.len() != 1024 || variance.iter().any(|value| *value <= 0.0) {
+            return Err(IndexTtsError::InvalidModel(format!(
+                "invalid Wav2Vec statistics: mean={}, var={}", mean.len(), variance.len()
+            )));
+        }
+        Ok(Self {
+            mean,
+            inverse_std: variance.into_iter().map(|value| 1.0 / value.sqrt()).collect(),
+        })
+    }
+
+    pub fn normalize(&self, tensor: Tensor) -> Result<Tensor> {
+        let Tensor::F32 { mut data, shape } = tensor else {
+            return Err(IndexTtsError::BackendFailure("Wav2Vec hidden states must be f32".into()));
+        };
+        if shape.last() != Some(&1024) {
+            return Err(IndexTtsError::BackendFailure(format!(
+                "Wav2Vec hidden width must be 1024, got {shape:?}"
+            )));
+        }
+        for row in data.chunks_exact_mut(1024) {
+            for index in 0..1024 {
+                row[index] = (row[index] - self.mean[index]) * self.inverse_std[index];
+            }
+        }
+        Ok(Tensor::F32 { data, shape })
+    }
+}
+
 pub fn run_campplus(session: &OnnxSession, features: Tensor) -> Result<Tensor> {
     session.run_tensors(vec![("x", features)], vec!["style".into()])?
         .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing CAMPPlus output".into()))

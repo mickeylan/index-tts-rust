@@ -17,6 +17,7 @@ once_cell = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 ort = { workspace = true }
 ndarray = { workspace = true }
+candle-core = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

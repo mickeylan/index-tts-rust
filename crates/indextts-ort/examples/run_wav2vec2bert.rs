@@ -1,9 +1,10 @@
-use indextts_ort::{run_wav2vec2bert, OnnxSession, Tensor};
+use indextts_ort::{run_wav2vec2bert, OnnxSession, Tensor, Wav2VecStats};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = std::env::args_os().nth(1).map(PathBuf::from)
-        .ok_or("usage: run_wav2vec2bert <model.onnx>")?;
+    let mut args = std::env::args_os().skip(1).map(PathBuf::from);
+    let model = args.next().ok_or("usage: run_wav2vec2bert <model.onnx> <stats.safetensors>")?;
+    let stats = args.next().ok_or("usage: run_wav2vec2bert <model.onnx> <stats.safetensors>")?;
     let session = OnnxSession::load(&model)?;
     let frames = 64usize;
     let features: Vec<f32> = (0..frames * 160)
@@ -16,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Tensor::new(features, vec![1, frames as i64, 160]),
         Tensor::new_i64(mask, vec![1, frames as i64]),
     )?;
+    let output = Wav2VecStats::load(&stats)?.normalize(output)?;
     println!("inputs={:?}", session.input_names());
     println!("outputs={:?}", session.output_names());
     println!("hidden_shape={:?}", output.shape());
