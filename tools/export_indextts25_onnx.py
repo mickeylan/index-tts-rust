@@ -326,11 +326,114 @@ def export_semantic_codec(source: Path, model_dir: Path, output: Path) -> None:
         raise RuntimeError(f"semantic codec dynamic parity failed: {dynamic_error}")
 
 
+def load_s2mel(source: Path, model_dir: Path):
+    sys.path.insert(0, str(source.resolve()))
+    import types
+    from omegaconf import OmegaConf
+
+    # IndexTTS imports VectorQuantize unconditionally although the 2.5 length
+    # regulator has vector_quantize=false. Avoid pulling the unrelated
+    # audiotools training dependency into this offline inference export.
+    quantize_module = "indextts.s2mel.dac.nn.quantize"
+    if quantize_module not in sys.modules:
+        stub = types.ModuleType(quantize_module)
+        class UnusedVectorQuantize:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("VectorQuantize is disabled by the IndexTTS-2.5 config")
+        stub.VectorQuantize = UnusedVectorQuantize
+        sys.modules[quantize_module] = stub
+
+    from indextts.s2mel.modules.commons import MyModel, load_checkpoint2
+    config = OmegaConf.load(model_dir / "config.yaml")
+    model = MyModel(config.s2mel)
+    model, _, _, _ = load_checkpoint2(
+        model, None, str(model_dir / config.s2mel_checkpoint),
+        load_only_params=True, ignore_modules=[], is_distributed=False,
+    )
+    return config, model.eval()
+
+
+def export_length_regulator(source: Path, model_dir: Path, output: Path) -> None:
+    from torch import nn
+
+    _, model = load_s2mel(source, model_dir)
+
+    class LengthRegulator(nn.Module):
+        def __init__(self, regulator):
+            super().__init__()
+            self.regulator = regulator
+
+        def forward(self, semantic_features, target_length):
+            return self.regulator(
+                semantic_features,
+                ylens=target_length,
+                n_quantizers=3,
+                f0=None,
+            )[0]
+
+    wrapper = LengthRegulator(model.models["length_regulator"]).eval()
+    torch.manual_seed(1234)
+    semantic = torch.randn(1, 34, 1024)
+    target_length = torch.tensor([58], dtype=torch.long)
+    with torch.no_grad():
+        expected = wrapper(semantic, target_length).cpu().numpy()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (semantic, target_length),
+        str(output),
+        input_names=["semantic_features", "target_length"],
+        output_names=["condition"],
+        dynamic_axes={
+            "semantic_features": {0: "batch", 1: "semantic_frames"},
+            "target_length": {0: "batch"},
+            "condition": {0: "batch", 1: "mel_frames"},
+        },
+        opset_version=17,
+        dynamo=False,
+    )
+
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    actual = session.run(
+        ["condition"],
+        {"semantic_features": semantic.numpy(), "target_length": target_length.numpy()},
+    )[0]
+    difference = np.abs(expected - actual)
+    max_error = float(np.max(difference))
+    mean_error = float(np.mean(difference))
+    print(
+        f"length_regulator output_shape={list(actual.shape)} "
+        f"max_abs_error={max_error:.9g} mean_abs_error={mean_error:.9g}"
+    )
+    if max_error > 0.003 or mean_error > 2e-5:
+        raise RuntimeError(
+            f"length regulator ONNX parity failed: max={max_error}, mean={mean_error}"
+        )
+
+    dynamic_semantic = torch.randn(1, 46, 1024)
+    dynamic_length = torch.tensor([79], dtype=torch.long)
+    with torch.no_grad():
+        expected_dynamic = wrapper(dynamic_semantic, dynamic_length).cpu().numpy()
+    actual_dynamic = session.run(
+        ["condition"],
+        {"semantic_features": dynamic_semantic.numpy(), "target_length": dynamic_length.numpy()},
+    )[0]
+    dynamic_error = float(np.max(np.abs(expected_dynamic - actual_dynamic)))
+    print(
+        f"length_regulator dynamic_output_shape={list(actual_dynamic.shape)} "
+        f"max_abs_error={dynamic_error:.9g}"
+    )
+    if dynamic_error > 0.003:
+        raise RuntimeError(f"length regulator dynamic parity failed: {dynamic_error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "component",
-        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec"],
+        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator"],
     )
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
@@ -345,6 +448,8 @@ def main() -> None:
         export_gpt_conditioning(args.source, args.model_dir, args.output)
     elif args.component == "semantic-codec":
         export_semantic_codec(args.source, args.model_dir, args.output)
+    elif args.component == "length-regulator":
+        export_length_regulator(args.source, args.model_dir, args.output)
 
 
 if __name__ == "__main__":

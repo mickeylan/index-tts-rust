@@ -306,6 +306,25 @@ pub fn run_semantic_codec(session: &OnnxSession, codes: &[u32]) -> Result<Tensor
     })
 }
 
+pub fn run_length_regulator(
+    session: &OnnxSession,
+    semantic_features: Tensor,
+    target_length: usize,
+) -> Result<Tensor> {
+    if target_length == 0 {
+        return Err(IndexTtsError::BackendFailure("length regulator target is zero".into()));
+    }
+    session.run_tensors(
+        vec![
+            ("semantic_features", semantic_features),
+            ("target_length", Tensor::new_i64(vec![target_length as i64], vec![1])),
+        ],
+        vec!["condition".into()],
+    )?.into_iter().next().ok_or_else(|| {
+        IndexTtsError::BackendFailure("missing length regulator output".into())
+    })
+}
+
 pub fn run_bigvgan(session: &OnnxSession, mel: Tensor) -> Result<Tensor> {
     session.run_tensors(vec![("mel", mel)], vec!["audio".into()])?
         .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing BigVGAN output".into()))
