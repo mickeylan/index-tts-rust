@@ -314,6 +314,77 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
     })
 }
 
+/// Compute the mean-centered Kaldi fbank consumed by CAMPPlus.
+pub fn campplus_fbank(audio: &AudioBuffer) -> Result<Vec<f32>> {
+    if audio.sample_rate != WAV2VEC_SAMPLE_RATE {
+        return Err(IndexTtsError::InvalidAudio(format!(
+            "CAMPPlus requires 16000 Hz audio, got {}", audio.sample_rate
+        )));
+    }
+    const FRAME: usize = 400;
+    const HOP: usize = 160;
+    const FFT: usize = 512;
+    const BINS: usize = FFT / 2;
+    const MELS: usize = 80;
+    if audio.samples.len() < FRAME {
+        return Err(IndexTtsError::InvalidAudio("audio is too short for CAMPPlus fbank".into()));
+    }
+    let frames = 1 + (audio.samples.len() - FRAME) / HOP;
+    let window: Vec<f64> = (0..FRAME).map(|index| {
+        let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (FRAME - 1) as f64).cos();
+        hann.powf(0.85)
+    }).collect();
+    let mel_min = 1127.0f64 * (1.0f64 + 20.0 / 700.0).ln();
+    let mel_max = 1127.0f64 * (1.0f64 + 8000.0 / 700.0).ln();
+    let mel_points: Vec<f64> = (0..MELS + 2)
+        .map(|index| mel_min + (mel_max - mel_min) * index as f64 / (MELS + 1) as f64)
+        .collect();
+    let fft_mels: Vec<f64> = (0..BINS).map(|index| {
+        let hz = WAV2VEC_SAMPLE_RATE as f64 / FFT as f64 * index as f64;
+        1127.0 * (1.0 + hz / 700.0).ln()
+    }).collect();
+
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(FFT);
+    let mut features = vec![0f32; frames * MELS];
+    let mut buffer = vec![Complex::new(0.0, 0.0); FFT];
+    for frame_index in 0..frames {
+        buffer.fill(Complex::new(0.0, 0.0));
+        let offset = frame_index * HOP;
+        let mean = audio.samples[offset..offset + FRAME].iter()
+            .map(|value| *value as f64).sum::<f64>() / FRAME as f64;
+        let mut previous = audio.samples[offset] as f64 - mean;
+        buffer[0].re = previous * (1.0 - 0.97) * window[0];
+        for index in 1..FRAME {
+            let current = audio.samples[offset + index] as f64 - mean;
+            buffer[index].re = (current - 0.97 * previous) * window[index];
+            previous = current;
+        }
+        fft.process(&mut buffer);
+        for mel in 0..MELS {
+            let left = mel_points[mel];
+            let center = mel_points[mel + 1];
+            let right = mel_points[mel + 2];
+            let mut energy = 0.0f64;
+            for bin in 0..BINS {
+                let frequency = fft_mels[bin];
+                let weight = ((frequency - left) / (center - left))
+                    .min((right - frequency) / (right - center)).max(0.0);
+                energy += buffer[bin].norm_sqr() * weight;
+            }
+            features[frame_index * MELS + mel] = energy.max(f32::EPSILON as f64).ln() as f32;
+        }
+    }
+    for mel in 0..MELS {
+        let mean = (0..frames).map(|frame| features[frame * MELS + mel] as f64)
+            .sum::<f64>() / frames as f64;
+        for frame in 0..frames {
+            features[frame * MELS + mel] -= mean as f32;
+        }
+    }
+    Ok(features)
+}
+
 /// Validate audio buffer
 pub fn validate_audio(audio: &AudioBuffer) -> Result<()> {
     if audio.samples.is_empty() {
@@ -420,16 +491,21 @@ mod tests {
         assert!(output.samples.iter().map(|sample| sample.abs()).fold(0.0, f32::max) > 0.4);
     }
 
-    #[test]
-    fn seamless_features_have_expected_shape_and_normalization() {
-        let samples: Vec<f32> = (0..WAV2VEC_SAMPLE_RATE)
+    fn test_waveform() -> Vec<f32> {
+        (0..WAV2VEC_SAMPLE_RATE)
             .map(|index| {
                 let time = index as f32 / WAV2VEC_SAMPLE_RATE as f32;
                 0.3 * (2.0 * std::f32::consts::PI * 220.0 * time).sin()
                     + 0.1 * (2.0 * std::f32::consts::PI * 630.0 * time).sin()
             })
-            .collect();
-        let features = seamless_m4t_features(&AudioBuffer::new(samples, WAV2VEC_SAMPLE_RATE)).unwrap();
+            .collect()
+    }
+
+    #[test]
+    fn seamless_features_have_expected_shape_and_normalization() {
+        let features = seamless_m4t_features(
+            &AudioBuffer::new(test_waveform(), WAV2VEC_SAMPLE_RATE)
+        ).unwrap();
         assert_eq!(features.frames, 49);
         assert_eq!(features.input_features.len(), 49 * 160);
         assert_eq!(features.attention_mask, vec![1; 49]);
@@ -449,6 +525,31 @@ mod tests {
                 (features.input_features[index] - expected).abs() < 1e-2,
                 "feature {index}: Rust={}, Python={expected}",
                 features.input_features[index]
+            );
+        }
+    }
+
+    #[test]
+    fn campplus_fbank_matches_torchaudio_reference() {
+        let features = campplus_fbank(
+            &AudioBuffer::new(test_waveform(), WAV2VEC_SAMPLE_RATE)
+        ).unwrap();
+        assert_eq!(features.len(), 98 * 80);
+        let official = [
+            (0, 1.4589176f32),
+            (1, 1.5607796),
+            (79, -0.7501602),
+            (80, -0.35348177),
+            (159, -0.7501602),
+            (160, 0.65457535),
+            (777, -0.0000009536743),
+            (7839, 0.5490694),
+        ];
+        for (index, expected) in official {
+            assert!(
+                (features[index] - expected).abs() < 1e-2,
+                "fbank {index}: Rust={}, Python={expected}",
+                features[index]
             );
         }
     }
