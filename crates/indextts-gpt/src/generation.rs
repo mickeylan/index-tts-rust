@@ -17,11 +17,10 @@
 //! - `do_sample=True`: SamplingGenerator with temperature
 //! - `num_beams > 1`: BeamGenerator (not yet implemented)
 
-use candle_core::{Tensor, Result as CandleResult, Device};
+use candle_core::{Device, IndexOp, Result as CandleResult, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use super::config::GptConfig;
 use super::model::IndexGpt;
 use super::cache::KvCache;
 
@@ -113,12 +112,8 @@ impl Generator for GreedyGenerator {
         
         loop {
             // Get logits for last position
-            let last_logits = logits.narrow(1, logits.dim(1)? - 1, 1)?;
-            let last_logits_flat = last_logits.reshape(())?;
-            
-            // Greedy: find max logit
-            let probs = softmax(&last_logits_flat)?;
-            let probs_vec = probs.to_vec1::<f32>()?;
+            let last_logits = logits.i((0, logits.dim(1)? - 1))?;
+            let probs_vec = last_logits.to_vec1::<f32>()?;
             
             let next_token = probs_vec
                 .iter()
@@ -302,7 +297,7 @@ impl SamplingGenerator {
         }
         
         // Sample from distribution
-        let r: f32 = self.rng.gen();
+        let r: f32 = self.rng.random();
         let mut cumsum = 0.0f32;
         for (i, &prob) in probs.iter().enumerate() {
             cumsum += prob;
@@ -343,9 +338,8 @@ impl Generator for SamplingGenerator {
         
         loop {
             // Get logits for last position
-            let last_logits = logits.narrow(1, logits.dim(1)? - 1, 1)?;
-            let last_logits_flat = last_logits.reshape(())?;
-            let logits_vec = last_logits_flat.to_vec1::<f32>()?;
+            let last_logits = logits.i((0, logits.dim(1)? - 1))?;
+            let logits_vec = last_logits.to_vec1::<f32>()?;
             
             // Sample next token
             let next_token = self.sample_token(&logits_vec);
@@ -429,14 +423,6 @@ impl Generator for BeamGenerator {
     fn reset(&mut self) {
         // No cache in beam search yet
     }
-}
-
-/// Helper: compute softmax over last dimension
-fn softmax(logits: &Tensor) -> CandleResult<Tensor> {
-    // Softmax over the last dimension
-    let exp = logits.exp()?;
-    let sum = exp.sum_all()?;
-    exp.broadcast_div(&sum)
 }
 
 #[cfg(test)]

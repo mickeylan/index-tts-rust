@@ -203,8 +203,12 @@ impl IndexGpt {
         let prefix_len = self.cached_prefix.as_ref()
             .ok_or_else(|| candle_core::Error::Msg("prefix embeddings are not prepared".into()))?
             .dim(1)?;
+        // The official wrapper leaves position 1 unused after the prefill start
+        // token: decode uses attention_mask_len - cached_prefix_len, yielding 2
+        // for the first generated semantic token.
         let mel_position = kv_cache.seq_len().checked_sub(prefix_len)
-            .ok_or_else(|| candle_core::Error::Msg("KV cache is shorter than prefix".into()))?;
+            .ok_or_else(|| candle_core::Error::Msg("KV cache is shorter than prefix".into()))?
+            + 1;
         if mel_position >= self.mel_position.max_len {
             candle_core::bail!("mel position {mel_position} exceeds position table")
         }

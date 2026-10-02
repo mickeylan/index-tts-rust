@@ -101,28 +101,25 @@ func main() {
 - ✅ CLI tool framework
 - ✅ CI configuration
 
-### Phase 1: GPT Semantic Token PoC ✅
+### Phase 1: GPT Semantic Token PoC (In Progress)
 - ✅ GPT configuration matching IndexTTS-2.5 (1280-dim, 24 layers, 20 heads)
-- ✅ KV Cache implementation
-- ✅ Greedy generator implementation
-- ✅ Sampling generator (temperature, top-k, top-p)
-- ✅ Beam search framework (placeholder)
-- ✅ Embedding layer structures (text, mel, position, language)
-- ✅ Speaker conditioning encoder framework (CAMPPlus, Perceiver)
-- ✅ YAML config loading
-- ✅ Generation strategies documented
-- ✅ GPT2 Attention, MLP, Block structures
-- ✅ Weight loading utilities framework
-- ✅ Expected weight names documented
+- ✅ Safetensors export and Candle loading for 296 required tensors
+- ✅ Weight names, shapes, and Conv1D layout validation
+- ✅ Real 24-layer Attention/MLP/LayerNorm forward pass
+- ✅ Prefill and incremental KV-cache decode
+- ✅ Greedy generation control loop
+- ✅ Python/Rust first-token parity
+- ✅ Python/Rust first 8 greedy semantic tokens are identical
+- 🔲 Full sequence parity through EOS
+- 🔲 Checked-in compact regression fixture (model weights remain external)
 
-### Phase 1.5: Weight Loading (In Progress)
-- 🔲 Safetensors weight loading
-- 🔲 PyTorch checkpoint support
-- 🔲 Weight validation and shape checking
+### Later generation modes
+- ✅ Temperature, top-k, top-p, and repetition-penalty framework
+- 🔲 Sampling RNG parity
+- 🔲 Beam search implementation
 
 ### Next Steps
-- 🔲 Full GPT forward pass implementation
-- 🔲 Python baseline parity testing
+- 🔲 Full Python/Rust semantic-code sequence parity through EOS
 - 🔲 ONNX backend integration
 - 🔲 End-to-end pipeline completion
 
