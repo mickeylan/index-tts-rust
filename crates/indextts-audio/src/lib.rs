@@ -314,6 +314,77 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
     })
 }
 
+/// Compute the 80-bin reference mel used by S2Mel.
+///
+/// This matches `s2mel.modules.audio.mel_spectrogram`: reflect padding,
+/// periodic Hann window, magnitude STFT, Slaney-normalized mel filters, and
+/// natural-log compression.
+pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
+    if audio.sample_rate != INDEXTTS_SAMPLE_RATE {
+        return Err(IndexTtsError::InvalidAudio(format!(
+            "reference mel requires 22050 Hz audio, got {}", audio.sample_rate
+        )));
+    }
+    const FFT: usize = 1024;
+    const HOP: usize = 256;
+    const BINS: usize = FFT / 2 + 1;
+    const MELS: usize = 80;
+    const PAD: usize = (FFT - HOP) / 2;
+    if audio.samples.len() <= PAD {
+        return Err(IndexTtsError::InvalidAudio("audio is too short for reference mel padding".into()));
+    }
+    let mut padded = Vec::with_capacity(audio.samples.len() + 2 * PAD);
+    padded.extend((1..=PAD).rev().map(|index| audio.samples[index]));
+    padded.extend_from_slice(&audio.samples);
+    padded.extend((1..=PAD).map(|index| audio.samples[audio.samples.len() - 1 - index]));
+    let frames = 1 + (padded.len() - FFT) / HOP;
+
+    fn hz_to_slaney_mel(hz: f64) -> f64 {
+        if hz < 1000.0 { hz / (200.0 / 3.0) }
+        else { 15.0 + (hz / 1000.0).ln() / ((6.4f64).ln() / 27.0) }
+    }
+    fn slaney_mel_to_hz(mel: f64) -> f64 {
+        if mel < 15.0 { mel * (200.0 / 3.0) }
+        else { 1000.0 * (((6.4f64).ln() / 27.0) * (mel - 15.0)).exp() }
+    }
+    let mel_max = hz_to_slaney_mel(INDEXTTS_SAMPLE_RATE as f64 / 2.0);
+    let frequencies: Vec<f64> = (0..MELS + 2)
+        .map(|index| slaney_mel_to_hz(mel_max * index as f64 / (MELS + 1) as f64))
+        .collect();
+    let fft_hz: Vec<f64> = (0..BINS)
+        .map(|index| INDEXTTS_SAMPLE_RATE as f64 / FFT as f64 * index as f64)
+        .collect();
+    let window: Vec<f64> = (0..FFT).map(|index| {
+        0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / FFT as f64).cos()
+    }).collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(FFT);
+    let mut buffer = vec![Complex::new(0.0, 0.0); FFT];
+    let mut output = vec![0f32; MELS * frames];
+    for frame in 0..frames {
+        let offset = frame * HOP;
+        for index in 0..FFT {
+            buffer[index] = Complex::new(padded[offset + index] as f64 * window[index], 0.0);
+        }
+        fft.process(&mut buffer);
+        for mel in 0..MELS {
+            let left = frequencies[mel];
+            let center = frequencies[mel + 1];
+            let right = frequencies[mel + 2];
+            let area_norm = 2.0 / (right - left);
+            let mut magnitude = 0.0f64;
+            for bin in 0..BINS {
+                let hz = fft_hz[bin];
+                let weight = ((hz - left) / (center - left))
+                    .min((right - hz) / (right - center)).max(0.0) * area_norm;
+                magnitude += (buffer[bin].norm_sqr() + 1e-9).sqrt() * weight;
+            }
+            output[mel * frames + frame] = magnitude.max(1e-5).ln() as f32;
+        }
+    }
+    Ok(output)
+}
+
 /// Compute the mean-centered Kaldi fbank consumed by CAMPPlus.
 pub fn campplus_fbank(audio: &AudioBuffer) -> Result<Vec<f32>> {
     if audio.sample_rate != WAV2VEC_SAMPLE_RATE {
@@ -526,6 +597,28 @@ mod tests {
                 "feature {index}: Rust={}, Python={expected}",
                 features.input_features[index]
             );
+        }
+    }
+
+    #[test]
+    fn reference_mel_matches_official_implementation() {
+        let samples: Vec<f32> = (0..INDEXTTS_SAMPLE_RATE)
+            .map(|index| {
+                let time = index as f32 / INDEXTTS_SAMPLE_RATE as f32;
+                0.3 * (2.0 * std::f32::consts::PI * 220.0 * time).sin()
+                    + 0.1 * (2.0 * std::f32::consts::PI * 630.0 * time).sin()
+            })
+            .collect();
+        let mel = reference_mel(&AudioBuffer::new(samples, INDEXTTS_SAMPLE_RATE)).unwrap();
+        assert_eq!(mel.len(), 80 * 86);
+        let official = [
+            (0, -0.81806934f32), (1, -2.5950215), (79, -6.8224835),
+            (80, -6.619554), (159, -5.7012401), (160, -5.6991324),
+            (777, -6.9009333), (6879, -7.3257093),
+        ];
+        for (index, expected) in official {
+            assert!((mel[index] - expected).abs() < 2e-3,
+                "mel {index}: Rust={}, Python={expected}", mel[index]);
         }
     }
 

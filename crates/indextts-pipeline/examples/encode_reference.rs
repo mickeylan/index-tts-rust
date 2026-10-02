@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("semantic_shape={:?}", conditioning.semantic.shape());
     println!("speaker_style_shape={:?}", conditioning.speaker_style.shape());
     println!("gpt_conditioning_shape={:?}", conditioning.gpt_conditioning.shape());
-    println!("reference_samples_22k={}", conditioning.reference_samples_22k);
+    println!("reference_mel_shape={:?}", conditioning.reference_mel.shape());
+    println!("prompt_condition_shape={:?}", conditioning.prompt_condition.shape());
     Ok(())
 }

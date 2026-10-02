@@ -19,8 +19,8 @@ use candle_core::{Device, Tensor as CandleTensor};
 use indextts_gpt::{Generator, GptConfig, GreedyGenerator, IndexGpt};
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
-use indextts_audio::{campplus_fbank, process_reference_audio, seamless_m4t_features, save_wav};
-use indextts_ort::{run_campplus, run_gpt_conditioning, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
+use indextts_audio::{campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features, save_wav};
+use indextts_ort::{run_campplus, run_gpt_conditioning, run_length_regulator, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn, instrument};
 
@@ -33,8 +33,10 @@ pub struct ReferenceConditioning {
     pub speaker_style: Tensor,
     /// Three GPT conditioning tokens `[1, 3, 1280]`.
     pub gpt_conditioning: Tensor,
-    /// Number of 22.05 kHz samples retained for reference-mel generation.
-    pub reference_samples_22k: usize,
+    /// Reference mel `[1, 80, mel_frames]`.
+    pub reference_mel: Tensor,
+    /// Length-regulated S2Mel prompt `[1, mel_frames, 512]`.
+    pub prompt_condition: Tensor,
 }
 
 /// Runtime for the two reference-audio encoder branches.
@@ -43,6 +45,7 @@ pub struct ReferenceEncoder {
     wav2vec: OnnxSession,
     campplus: OnnxSession,
     gpt_conditioning: OnnxSession,
+    length_regulator: OnnxSession,
     stats: Wav2VecStats,
 }
 
@@ -52,6 +55,7 @@ impl ReferenceEncoder {
             wav2vec: OnnxSession::load(&OnnxModel::Wav2Vec2Bert.path(model_dir))?,
             campplus: OnnxSession::load(&OnnxModel::Campplus.path(model_dir))?,
             gpt_conditioning: OnnxSession::load(&OnnxModel::GptConditioning.path(model_dir))?,
+            length_regulator: OnnxSession::load(&OnnxModel::LengthRegulator.path(model_dir))?,
             stats: Wav2VecStats::load(&model_dir.join("wav2vec2bert_stats.safetensors"))?,
         })
     }
@@ -83,6 +87,14 @@ impl ReferenceEncoder {
             speaker_style.clone(),
             semantic.clone(),
         )?;
+        let mel = reference_mel(&audio_22k)?;
+        let mel_frames = mel.len() / 80;
+        let reference_mel = Tensor::new(mel, vec![1, 80, mel_frames as i64]);
+        let prompt_condition = run_length_regulator(
+            &self.length_regulator,
+            semantic.clone(),
+            mel_frames,
+        )?;
         if semantic.shape().first() != Some(&1) || semantic.shape().last() != Some(&1024) {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
                 "invalid semantic conditioning shape {:?}", semantic.shape()
@@ -98,11 +110,17 @@ impl ReferenceEncoder {
                 "invalid GPT conditioning shape {:?}", gpt_conditioning.shape()
             )));
         }
+        if prompt_condition.shape() != [1, mel_frames as i64, 512] {
+            return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+                "invalid prompt condition shape {:?}", prompt_condition.shape()
+            )));
+        }
         Ok(ReferenceConditioning {
             semantic,
             speaker_style,
             gpt_conditioning,
-            reference_samples_22k: audio_22k.samples.len(),
+            reference_mel,
+            prompt_condition,
         })
     }
 }
