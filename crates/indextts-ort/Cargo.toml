@@ -18,6 +18,9 @@ serde = { workspace = true, features = ["derive"] }
 ort = { workspace = true }
 ndarray = { workspace = true }
 candle-core = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rand_distr = "0.5"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -429,11 +429,89 @@ def export_length_regulator(source: Path, model_dir: Path, output: Path) -> None
         raise RuntimeError(f"length regulator dynamic parity failed: {dynamic_error}")
 
 
+def export_dit(source: Path, model_dir: Path, output: Path) -> None:
+    _, model = load_s2mel(source, model_dir)
+    estimator = model.models["cfm"].estimator
+    estimator.setup_caches(max_batch_size=2, max_seq_length=8192)
+    estimator.eval()
+    # Avoid a legacy TorchScript exporter bug for Tensor + bool in the
+    # sequence-mask expression; these flags are false in the official config.
+    if estimator.style_as_token is False:
+        estimator.style_as_token = 0
+    if estimator.time_as_token is False:
+        estimator.time_as_token = 0
+
+    # The scripted helper cannot be inspected by the legacy ONNX tracer.
+    import indextts.s2mel.modules.commons as commons_module
+    from indextts.s2mel.modules import wavenet as wavenet_module
+    original_common = commons_module.fused_add_tanh_sigmoid_multiply
+    original_wavenet = wavenet_module.commons.fused_add_tanh_sigmoid_multiply
+    def plain_fused(input_a, input_b, n_channels):
+        channels = n_channels[0]
+        activation = input_a + input_b
+        return torch.tanh(activation[:, :channels, :]) * torch.sigmoid(activation[:, channels:, :])
+    commons_module.fused_add_tanh_sigmoid_multiply = plain_fused
+    wavenet_module.commons.fused_add_tanh_sigmoid_multiply = plain_fused
+    for module in estimator.modules():
+        try:
+            torch.nn.utils.remove_weight_norm(module)
+        except ValueError:
+            pass
+
+    torch.manual_seed(1234)
+    batch, frames = 2, 64
+    x = torch.randn(batch, 80, frames)
+    prompt = torch.randn(batch, 80, frames)
+    lengths = torch.full((batch,), frames, dtype=torch.long)
+    time = torch.tensor([0.4, 0.4])
+    style = torch.randn(batch, 192)
+    condition = torch.randn(batch, frames, 512)
+    with torch.no_grad():
+        expected = estimator(x, prompt, lengths, time, style, condition).cpu().numpy()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        torch.onnx.export(
+            estimator,
+            (x, prompt, lengths, time, style, condition),
+            str(output),
+            input_names=["x", "prompt_x", "x_lens", "t", "style", "condition"],
+            output_names=["velocity"],
+            dynamic_axes={
+                "x": {0: "batch", 2: "frames"}, "prompt_x": {0: "batch", 2: "frames"},
+                "x_lens": {0: "batch"}, "t": {0: "batch"}, "style": {0: "batch"},
+                "condition": {0: "batch", 1: "frames"},
+                "velocity": {0: "batch", 2: "frames"},
+            },
+            opset_version=17,
+            dynamo=False,
+        )
+    finally:
+        commons_module.fused_add_tanh_sigmoid_multiply = original_common
+        wavenet_module.commons.fused_add_tanh_sigmoid_multiply = original_wavenet
+
+    import onnxruntime as ort
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    inputs = {
+        "x": x.numpy(), "prompt_x": prompt.numpy(), "x_lens": lengths.numpy(),
+        "t": time.numpy(), "style": style.numpy(), "condition": condition.numpy(),
+    }
+    actual = session.run(["velocity"], inputs)[0]
+    difference = np.abs(expected - actual)
+    max_error = float(np.max(difference))
+    mean_error = float(np.mean(difference))
+    print(
+        f"dit output_shape={list(actual.shape)} max_abs_error={max_error:.9g} "
+        f"mean_abs_error={mean_error:.9g}"
+    )
+    if max_error > 0.01 or mean_error > 1e-4:
+        raise RuntimeError(f"DiT ONNX parity failed: max={max_error}, mean={mean_error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "component",
-        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator"],
+        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator", "dit"],
     )
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
@@ -450,6 +528,8 @@ def main() -> None:
         export_semantic_codec(args.source, args.model_dir, args.output)
     elif args.component == "length-regulator":
         export_length_regulator(args.source, args.model_dir, args.output)
+    elif args.component == "dit":
+        export_dit(args.source, args.model_dir, args.output)
 
 
 if __name__ == "__main__":

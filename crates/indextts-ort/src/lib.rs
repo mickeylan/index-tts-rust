@@ -5,6 +5,9 @@ use ort::{
     session::{Session, SessionInputValue},
     value::{DynTensor, Tensor as OrtTensor},
 };
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use rand_distr::StandardNormal;
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
 /// Owned host tensor accepted by the runtime wrapper.
@@ -323,6 +326,100 @@ pub fn run_length_regulator(
     )?.into_iter().next().ok_or_else(|| {
         IndexTtsError::BackendFailure("missing length regulator output".into())
     })
+}
+
+pub fn run_dit(
+    session: &OnnxSession,
+    x: Tensor,
+    prompt: Tensor,
+    lengths: Tensor,
+    time: Tensor,
+    style: Tensor,
+    condition: Tensor,
+) -> Result<Tensor> {
+    session.run_tensors(
+        vec![
+            ("x", x), ("prompt_x", prompt), ("x_lens", lengths),
+            ("t", time), ("style", style), ("condition", condition),
+        ],
+        vec!["velocity".into()],
+    )?.into_iter().next().ok_or_else(|| {
+        IndexTtsError::BackendFailure("missing DiT velocity output".into())
+    })
+}
+
+/// Run the official 25-step Euler CFM solver with classifier-free guidance.
+pub fn solve_cfm(
+    session: &OnnxSession,
+    condition: &Tensor,
+    prompt_mel: &Tensor,
+    style: &Tensor,
+    steps: usize,
+    cfg_rate: f32,
+    seed: u64,
+) -> Result<Tensor> {
+    if steps == 0 { return Err(IndexTtsError::BackendFailure("CFM steps must be positive".into())); }
+    let Tensor::F32 { data: condition_data, shape: condition_shape } = condition else {
+        return Err(IndexTtsError::BackendFailure("CFM condition must be f32".into()));
+    };
+    let Tensor::F32 { data: prompt_data, shape: prompt_shape } = prompt_mel else {
+        return Err(IndexTtsError::BackendFailure("CFM prompt must be f32".into()));
+    };
+    let Tensor::F32 { data: style_data, shape: style_shape } = style else {
+        return Err(IndexTtsError::BackendFailure("CFM style must be f32".into()));
+    };
+    if condition_shape.len() != 3 || condition_shape[0] != 1 || condition_shape[2] != 512
+        || prompt_shape.len() != 3 || prompt_shape[0] != 1 || prompt_shape[1] != 80
+        || style_shape.as_slice() != [1, 192]
+    {
+        return Err(IndexTtsError::BackendFailure(format!(
+            "invalid CFM shapes: condition={condition_shape:?}, prompt={prompt_shape:?}, style={style_shape:?}"
+        )));
+    }
+    let total_frames = condition_shape[1] as usize;
+    let prompt_frames = prompt_shape[2] as usize;
+    if prompt_frames > total_frames {
+        return Err(IndexTtsError::BackendFailure("CFM prompt exceeds condition length".into()));
+    }
+    let frame_values = 80 * total_frames;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut x: Vec<f32> = (0..frame_values).map(|_| rng.sample(StandardNormal)).collect();
+    let mut prompt = vec![0f32; frame_values];
+    for channel in 0..80 {
+        let source = &prompt_data[channel * prompt_frames..(channel + 1) * prompt_frames];
+        prompt[channel * total_frames..channel * total_frames + prompt_frames].copy_from_slice(source);
+        x[channel * total_frames..channel * total_frames + prompt_frames].fill(0.0);
+    }
+    let dt = 1.0 / steps as f32;
+    for step in 0..steps {
+        let mut stacked_x = x.clone(); stacked_x.extend_from_slice(&x);
+        let mut stacked_prompt = prompt.clone(); stacked_prompt.extend(vec![0f32; frame_values]);
+        let mut stacked_style = style_data.clone(); stacked_style.extend(vec![0f32; 192]);
+        let mut stacked_condition = condition_data.clone(); stacked_condition.extend(vec![0f32; condition_data.len()]);
+        let velocity = run_dit(
+            session,
+            Tensor::new(stacked_x, vec![2, 80, total_frames as i64]),
+            Tensor::new(stacked_prompt, vec![2, 80, total_frames as i64]),
+            Tensor::new_i64(vec![total_frames as i64, total_frames as i64], vec![2]),
+            Tensor::new(vec![step as f32 * dt; 2], vec![2]),
+            Tensor::new(stacked_style, vec![2, 192]),
+            Tensor::new(stacked_condition, vec![2, total_frames as i64, 512]),
+        )?;
+        let values = velocity.as_slice();
+        if values.len() != 2 * frame_values {
+            return Err(IndexTtsError::BackendFailure(format!("unexpected DiT output shape {:?}", velocity.shape())));
+        }
+        for index in 0..frame_values {
+            let guided = (1.0 + cfg_rate) * values[index] - cfg_rate * values[frame_values + index];
+            x[index] += dt * guided;
+        }
+        if step + 1 < steps {
+            for channel in 0..80 {
+                x[channel * total_frames..channel * total_frames + prompt_frames].fill(0.0);
+            }
+        }
+    }
+    Ok(Tensor::new(x, vec![1, 80, total_frames as i64]))
 }
 
 pub fn run_bigvgan(session: &OnnxSession, mel: Tensor) -> Result<Tensor> {
