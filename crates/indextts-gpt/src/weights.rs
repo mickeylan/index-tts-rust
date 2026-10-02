@@ -51,9 +51,14 @@ impl Weights {
         })
     }
 
-    /// Get a weight tensor
+    /// Get a weight tensor.
     pub fn get(&self, name: &str) -> Option<&Tensor> {
         self.tensors.get(name)
+    }
+
+    /// Borrow the complete state dictionary.
+    pub fn as_map(&self) -> &HashMap<String, Tensor> {
+        &self.tensors
     }
 
     /// Check if weight exists
