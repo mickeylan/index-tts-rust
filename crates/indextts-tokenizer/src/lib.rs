@@ -1,320 +1,162 @@
-//! Tokenizer for IndexTTS-2.5
-//!
-//! Handles tokenization of text using tiktoken-style BPE tokenizer
-//! and pinyin vocabulary for Chinese text.
+//! IndexTTS-2.5 tokenizer backed by the official tiktoken vocabulary.
 
-use indextts_core::{IndexTtsError, Language, Result, GenerationConfig};
-use std::collections::HashMap;
-use std::path::Path;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use indextts_core::{IndexTtsError, Language, Result};
+use rustc_hash::FxHashMap;
+use std::{collections::HashMap, fmt, path::Path};
+use tiktoken_rs::CoreBPE;
 
-/// Tiktoken-style BPE tokenizer
-#[derive(Debug, Clone)]
+const PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+
+const LANGUAGES: &[&str] = &[
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
+    "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu",
+    "ta", "no", "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa",
+    "lv", "bn", "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn",
+    "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc",
+    "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn",
+    "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw",
+    "su", "yue", "minnan", "wuyu", "dialect", "zh/en", "en/zh", "common",
+];
+const AUDIO_EVENTS: &[&str] = &["ASR", "AED", "SER", "Speech", "/Speech", "BGM", "/BGM", "Laughter", "/Laughter", "Applause", "/Applause"];
+const EMOTIONS: &[&str] = &["HAPPY", "SAD", "ANGRY", "NEUTRAL"];
+const TTS_TOKENS: &[&str] = &["TTS/B", "TTS/O", "TTS/Q", "TTS/A", "TTS/CO", "TTS/CL", "TTS/H", "TTS/SP01", "TTS/SP02", "TTS/SP03", "TTS/SP04", "TTS/SP05", "TTS/SP06", "TTS/SP07", "TTS/SP08", "TTS/SP09", "TTS/SP10", "TTS/SP11", "TTS/SP12", "TTS/SP13"];
+
+#[derive(Clone)]
 pub struct TiktokenTokenizer {
-    /// Merge ranks (BPE)
-    merges: HashMap<(u32, u32), u32>,
-    /// Encoder (vocab)
-    encoder: HashMap<String, u32>,
-    /// Special tokens
+    bpe: CoreBPE,
     special_tokens: HashMap<String, u32>,
-    /// Decoder
-    decoder: HashMap<u32, String>,
-    /// Special token IDs
-    special_ids: HashMap<u32, String>,
+    vocab_size: usize,
+}
+
+impl fmt::Debug for TiktokenTokenizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TiktokenTokenizer").field("vocab_size", &self.vocab_size).finish()
+    }
 }
 
 impl TiktokenTokenizer {
-    /// Load tokenizer from tiktoken file
     pub fn from_file(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Self::from_str(&content)
+        Self::from_str(&std::fs::read_to_string(path)?)
     }
 
-    /// Parse tiktoken content
     pub fn from_str(content: &str) -> Result<Self> {
-        let mut encoder: HashMap<String, u32> = HashMap::new();
-        let mut decoder: HashMap<u32, String> = HashMap::new();
-        let mut merges: HashMap<(u32, u32), u32> = HashMap::new();
-        let mut special_tokens: HashMap<String, u32> = HashMap::new();
-        let mut special_ids: HashMap<u32, String> = HashMap::new();
-
-        let mut lines = content.lines();
-        
-        // Skip header
-        while let Some(line) = lines.next() {
-            if line.starts_with("|") {
-                break;
-            }
-        }
-
-        // Parse vocab and merges
-        for line in lines {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            
-            if line.starts_with("|") {
-                // Special token line: |token|<space>id|
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let token = parts[0].trim_start_matches('|').to_string();
-                    if let Ok(id) = parts[1].trim_end_matches('|').parse::<u32>() {
-                        encoder.insert(token.clone(), id);
-                        decoder.insert(id, token.clone());
-                        special_tokens.insert(token, id);
-                        special_ids.insert(id, parts[0].trim_start_matches('|').to_string());
-                    }
-                }
-            } else if line.contains(' ') || line.contains('\t') {
-                // Merge line: "A B" rank
-                let parts: Vec<&str> = if line.contains('\t') {
-                    line.split('\t').collect()
-                } else {
-                    line.split(' ').collect()
-                };
-                if parts.len() >= 2 {
-                    let first = parts[0];
-                    let second = parts[1];
-                    let rank = if let Ok(r) = parts[parts.len()-1].parse::<u32>() {
-                        r
-                    } else {
-                        continue;
-                    };
-                    
-                    // Get IDs for merge pairs
-                    if let (Some(&id1), Some(&id2)) = (encoder.get(first), encoder.get(second)) {
-                        merges.insert((id1, id2), rank);
-                    }
-                }
+        let mut ranks = FxHashMap::default();
+        for (line_number, line) in content.lines().enumerate() {
+            if line.trim().is_empty() { continue; }
+            let mut parts = line.split_whitespace();
+            let token = parts.next().ok_or_else(|| IndexTtsError::InvalidModel(format!("invalid tiktoken line {}", line_number + 1)))?;
+            let rank: u32 = parts.next().ok_or_else(|| IndexTtsError::InvalidModel(format!("missing rank on tiktoken line {}", line_number + 1)))?
+                .parse().map_err(|error| IndexTtsError::InvalidModel(format!("invalid rank on line {}: {error}", line_number + 1)))?;
+            // Python's base64 decoder accepts the historical single "=" entry
+            // in the official vocabulary and decodes it as empty bytes.
+            let bytes = if token == "=" {
+                Vec::new()
             } else {
-                // Vocab entry: token id
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(id) = parts[1].parse::<u32>() {
-                        encoder.insert(parts[0].to_string(), id);
-                        decoder.insert(id, parts[0].to_string());
-                    }
-                }
-            }
+                STANDARD.decode(token).map_err(|error| IndexTtsError::InvalidModel(format!("invalid base64 token on line {}: {error}", line_number + 1)))?
+            };
+            ranks.insert(bytes, rank);
         }
-
-        Ok(Self {
-            merges,
-            encoder,
-            special_tokens,
-            decoder,
-            special_ids,
-        })
+        if ranks.is_empty() {
+            return Err(IndexTtsError::InvalidModel("empty tiktoken vocabulary".into()));
+        }
+        let mut specials = Vec::new();
+        specials.push("<|endoftext|>".to_owned());
+        specials.push("<|startoftranscript|>".to_owned());
+        specials.extend(LANGUAGES.iter().take(99).map(|value| format!("<|{value}|>")));
+        specials.extend(AUDIO_EVENTS.iter().map(|value| format!("<|{value}|>")));
+        specials.extend(EMOTIONS.iter().map(|value| format!("<|{value}|>")));
+        specials.extend(["translate", "transcribe", "startoflm", "startofprev", "nospeech", "notimestamps"].map(|value| format!("<|{value}|>")));
+        specials.extend((1..=30).map(|index| format!("<|SPECIAL_TOKEN_{index}|>")));
+        specials.extend(TTS_TOKENS.iter().map(|value| format!("<|{value}|>")));
+        specials.extend((0..=1500).map(|index| format!("<|{:.2}|>", index as f32 * 0.02)));
+        let base_size = ranks.len();
+        let special_tokens: FxHashMap<String, u32> = specials.into_iter().enumerate()
+            .map(|(offset, token)| (token, (base_size + offset) as u32)).collect();
+        let exposed_specials = special_tokens.iter()
+            .map(|(token, rank)| (token.clone(), *rank)).collect();
+        let bpe = CoreBPE::new(ranks, special_tokens, PATTERN)
+            .map_err(|error| IndexTtsError::InvalidModel(format!("failed to construct tiktoken BPE: {error}")))?;
+        Ok(Self { bpe, special_tokens: exposed_specials, vocab_size: base_size })
     }
 
-    /// Encode text to token IDs
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let mut tokens = Vec::new();
-        
-        // Simple byte-level encoding with BPE merges
-        let bytes: Vec<u8> = text.as_bytes().to_vec();
-        let mut token_ids: Vec<u32> = bytes.iter().map(|&b| b as u32).collect();
-        
-        // Apply BPE merges
-        loop {
-            let mut best_merge: Option<((u32, u32), u32)> = None;
-            
-            for i in 0..token_ids.len().saturating_sub(1) {
-                let pair = (token_ids[i], token_ids[i + 1]);
-                if let Some(&rank) = self.merges.get(&pair) {
-                    if best_merge.map(|(_, r)| rank < r).unwrap_or(true) {
-                        best_merge = Some((pair, rank));
-                    }
-                }
-            }
-            
-            match best_merge {
-                Some(((first, second), _)) => {
-                    let mut new_tokens = Vec::new();
-                    let mut i = 0;
-                    while i < token_ids.len() {
-                        if i < token_ids.len().saturating_sub(1) 
-                            && token_ids[i] == first 
-                            && token_ids[i + 1] == second {
-                            new_tokens.push(first * 256 + second);
-                            i += 2;
-                        } else {
-                            new_tokens.push(token_ids[i]);
-                            i += 1;
-                        }
-                    }
-                    token_ids = new_tokens;
-                }
-                None => break,
-            }
-        }
-        
-        tokens.extend(token_ids);
-        Ok(tokens)
+        Ok(self.bpe.encode_with_special_tokens(text).into_iter().map(|value| value as u32).collect())
     }
 
-    /// Decode token IDs to text
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
-        let mut result = String::new();
-        for &token in tokens {
-            if let Some(text) = self.decoder.get(&token) {
-                result.push_str(text);
-            } else {
-                // Fallback: convert byte
-                result.push(token as u8 as char);
-            }
-        }
-        Ok(result)
+        self.bpe.decode(tokens.to_vec())
+            .map_err(|error| IndexTtsError::InvalidText(error.to_string()))
     }
 
-    /// Get special token ID
+    pub fn encode_ordinary(&self, text: &str) -> Vec<u32> {
+        self.bpe.encode_ordinary(text).into_iter().map(|value| value as u32).collect()
+    }
+
     pub fn special_token_id(&self, token: &str) -> Option<u32> {
         self.special_tokens.get(token).copied()
     }
 
-    /// Get vocab size
-    pub fn vocab_size(&self) -> usize {
-        self.encoder.len()
-    }
+    pub fn vocab_size(&self) -> usize { self.vocab_size }
 }
 
-/// Pinyin vocabulary for Chinese text
 #[derive(Debug, Clone)]
 pub struct PinyinVocab {
-    /// Pinyin to ID mapping
     pinyin_to_id: HashMap<String, u32>,
-    /// ID to pinyin mapping
     id_to_pinyin: HashMap<u32, String>,
 }
 
 impl PinyinVocab {
-    /// Load from file
-    pub fn from_file(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Self::from_str(&content)
-    }
-
-    /// Parse pinyin vocab content
+    pub fn from_file(path: &Path) -> Result<Self> { Self::from_str(&std::fs::read_to_string(path)?) }
     pub fn from_str(content: &str) -> Result<Self> {
         let mut pinyin_to_id = HashMap::new();
         let mut id_to_pinyin = HashMap::new();
-        
         for (id, line) in content.lines().enumerate() {
-            let line = line.trim();
-            if !line.is_empty() {
-                pinyin_to_id.insert(line.to_string(), id as u32);
-                id_to_pinyin.insert(id as u32, line.to_string());
+            let value = line.trim();
+            if !value.is_empty() {
+                pinyin_to_id.insert(value.to_owned(), id as u32);
+                id_to_pinyin.insert(id as u32, value.to_owned());
             }
         }
-        
-        Ok(Self {
-            pinyin_to_id,
-            id_to_pinyin,
-        })
+        Ok(Self { pinyin_to_id, id_to_pinyin })
     }
-
-    /// Get pinyin ID
-    pub fn get_id(&self, pinyin: &str) -> Option<u32> {
-        self.pinyin_to_id.get(pinyin).copied()
-    }
-
-    /// Get pinyin string
-    pub fn get_pinyin(&self, id: u32) -> Option<&str> {
-        self.id_to_pinyin.get(&id).map(|s| s.as_str())
-    }
-
-    /// Get vocab size
-    pub fn vocab_size(&self) -> usize {
-        self.pinyin_to_id.len()
-    }
+    pub fn get_id(&self, value: &str) -> Option<u32> { self.pinyin_to_id.get(value).copied() }
+    pub fn get_pinyin(&self, id: u32) -> Option<&str> { self.id_to_pinyin.get(&id).map(String::as_str) }
+    pub fn vocab_size(&self) -> usize { self.pinyin_to_id.len() }
 }
 
-/// Combined tokenizer for IndexTTS
 #[derive(Debug, Clone)]
 pub struct IndexTtsTokenizer {
-    /// Main BPE tokenizer
     tiktoken: TiktokenTokenizer,
-    /// Pinyin vocabulary
     pinyin_vocab: PinyinVocab,
 }
 
 impl IndexTtsTokenizer {
-    /// Create a new tokenizer
-    pub fn new(tiktoken: TiktokenTokenizer, pinyin_vocab: PinyinVocab) -> Self {
-        Self {
-            tiktoken,
-            pinyin_vocab,
-        }
-    }
-
-    /// Load tokenizer from directory
+    pub fn new(tiktoken: TiktokenTokenizer, pinyin_vocab: PinyinVocab) -> Self { Self { tiktoken, pinyin_vocab } }
     pub fn from_dir(dir: &Path) -> Result<Self> {
-        let tiktoken_path = dir.join("multilingual_zh_ja_yue_char_del.tiktoken");
-        let pinyin_path = dir.join("pinyin.vocab");
-        
-        let tiktoken = TiktokenTokenizer::from_file(&tiktoken_path)?;
-        let pinyin_vocab = PinyinVocab::from_file(&pinyin_path)?;
-        
-        Ok(Self::new(tiktoken, pinyin_vocab))
+        Ok(Self::new(
+            TiktokenTokenizer::from_file(&dir.join("multilingual_zh_ja_yue_char_del.tiktoken"))?,
+            PinyinVocab::from_file(&dir.join("pinyin.vocab"))?,
+        ))
     }
-
-    /// Tokenize text with language awareness
-    pub fn tokenize(&self, text: &str, _language: Language) -> Result<Vec<u32>> {
-        // For now, use simple byte-level encoding
-        // Full implementation would handle Chinese text with pinyin
-        self.tiktoken.encode(text)
-    }
-
-    /// Tokenize for GPT input (with special tokens)
-    pub fn tokenize_for_gpt(&self, text: &str, language: Language) -> Result<Vec<u32>> {
-        let mut tokens = Vec::new();
-        
-        // Add language token
-        let lang_token = match language {
-            Language::Zh => "[ZH]",
-            Language::En => "[EN]",
-            Language::Ja => "[JA]",
-            Language::Es => "[ES]",
-            Language::Ar => "[AR]",
-        };
-        
-        // Add start text token
-        tokens.push(0); // START_TEXT_TOKEN
-        
-        // Tokenize text
-        let text_tokens = self.tokenize(text, language)?;
-        tokens.extend(text_tokens);
-        
-        // Add stop text token
-        tokens.push(1); // STOP_TEXT_TOKEN
-        
+    pub fn tokenize(&self, text: &str, language: Language) -> Result<Vec<u32>> {
+        let special = format!("<|{}|>", language.code().to_lowercase());
+        let language_id = self.tiktoken.special_token_id(&special)
+            .ok_or_else(|| IndexTtsError::InvalidModel(format!("missing language token {special}")))?;
+        let mut tokens = vec![language_id];
+        tokens.extend(self.tiktoken.encode_ordinary(&format!(" {text}")));
         Ok(tokens)
     }
-
-    /// Get vocab size
-    pub fn vocab_size(&self) -> usize {
-        self.tiktoken.vocab_size()
+    /// The GPT model itself adds text start/stop tokens; this returns raw tokenizer IDs.
+    pub fn tokenize_for_gpt(&self, text: &str, language: Language) -> Result<Vec<u32>> {
+        self.tokenize(text, language)
     }
+    pub fn vocab_size(&self) -> usize { self.tiktoken.vocab_size() }
+    pub fn pinyin_vocab(&self) -> &PinyinVocab { &self.pinyin_vocab }
 }
 
-/// Language dictionary (from Python tokenizer.py)
-pub const LANGUAGE_DICT: &[(&str, u32)] = &[
-    ("<zh>", 0),
-    ("<en>", 1),
-    ("<ja>", 2),
-    ("<es>", 3),
-    ("<ar>", 4),
-];
-
-/// Get language token ID
 pub fn language_token_id(language: Language) -> u32 {
-    match language {
-        Language::Zh => 0,
-        Language::En => 1,
-        Language::Ja => 2,
-        Language::Es => 3,
-        Language::Ar => 4,
-    }
+    match language { Language::En => 0, Language::Zh => 1, Language::Es => 3, Language::Ja => 7, Language::Ar => 13 }
 }
 
 #[cfg(test)]
@@ -322,11 +164,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_language_token_id() {
-        assert_eq!(language_token_id(Language::Zh), 0);
-        assert_eq!(language_token_id(Language::En), 1);
-        assert_eq!(language_token_id(Language::Ja), 2);
+    fn official_tokenizer_matches_python() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/model-export/tokenizer-fixture");
+        if !dir.exists() { return; }
+        let tokenizer = IndexTtsTokenizer::from_dir(&dir).unwrap();
+        assert_eq!(tokenizer.tokenize("你好世界", Language::Zh).unwrap(), vec![58839, 220, 48934, 50371, 48721, 53743]);
+        assert_eq!(tokenizer.tokenize("Hello world", Language::En).unwrap(), vec![58838, 2415, 1002]);
+    }
+
+    #[test]
+    fn language_ids_follow_official_dictionary_order() {
+        assert_eq!(language_token_id(Language::En), 0);
+        assert_eq!(language_token_id(Language::Zh), 1);
+        assert_eq!(language_token_id(Language::Ja), 7);
         assert_eq!(language_token_id(Language::Es), 3);
-        assert_eq!(language_token_id(Language::Ar), 4);
+        assert_eq!(language_token_id(Language::Ar), 13);
     }
 }

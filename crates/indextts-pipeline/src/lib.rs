@@ -113,7 +113,7 @@ pub struct IndexTtsPipeline {
     /// Text normalizer
     normalizer: TextNormalizer,
     /// Tokenizer
-    tokenizer: IndexTtsTokenizer,
+    tokenizer: Option<IndexTtsTokenizer>,
     /// Model loaded flag
     loaded: bool,
 }
@@ -124,10 +124,7 @@ impl IndexTtsPipeline {
         Self {
             config,
             normalizer: TextNormalizer::new(),
-            tokenizer: IndexTtsTokenizer::new(
-                indextts_tokenizer::TiktokenTokenizer::from_str("").unwrap(),
-                indextts_tokenizer::PinyinVocab::from_str("").unwrap(),
-            ),
+            tokenizer: None,
             loaded: false,
         }
     }
@@ -137,7 +134,7 @@ impl IndexTtsPipeline {
     pub fn load(&mut self) -> TtsResult<()> {
         info!("Loading IndexTTS-2.5 models from {:?}", self.config.model_dir);
         
-        // Placeholder: just mark as loaded
+        self.tokenizer = Some(IndexTtsTokenizer::from_dir(&self.config.model_dir)?);
         self.loaded = true;
         
         info!("Model loading complete (placeholder)");
@@ -159,7 +156,10 @@ impl IndexTtsPipeline {
         info!("Normalized text: {}", normalized);
         
         // 2. Tokenize
-        let tokens = self.tokenizer.tokenize_for_gpt(&normalized, gen_config.language)?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let tokens = tokenizer.tokenize_for_gpt(&normalized, gen_config.language)?;
         info!("Tokenized to {} tokens", tokens.len());
         
         // 3. Process reference audio
