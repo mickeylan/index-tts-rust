@@ -1,0 +1,26 @@
+[package]
+name = "indextts-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Complete IndexTTS-2.5 inference pipeline"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+indextts-core = { workspace = true }
+indextts-text = { workspace = true }
+indextts-tokenizer = { workspace = true }
+indextts-audio = { workspace = true }
+indextts-gpt = { workspace = true }
+indextts-ort = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

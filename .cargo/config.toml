@@ -1,0 +1,35 @@
+[build]
+# Enable CUDA support for candle
+rustflags = ["-C", "target-feature=+cuda"]
+
+[target.x86_64-pc-windows-msvc]
+# Windows specific settings
+linker = "rust-lld"
+
+[alias]
+# Quick test commands
+t = "test"
+tb = "test -- --nocapture"
+b = "build --release"
+
+# Full workspace check
+check-all = "check --workspace --all-targets --all-features"
+
+# Generate docs
+docs = "doc --workspace --no-deps --open"
+
+# Format and check
+fmt-check = "fmt --all -- --check"
+clippy-all = "clippy --workspace --all-targets --all-features -- -D warnings"
+
+[net]
+# Use git for fetching crates
+git-fetch-with-cli = true
+
+[http]
+# Enable HTTP multiplexing
+multiplexing = true
+
+[cache]
+# Enable disk cache
+directory = "target/.cargo-cache"

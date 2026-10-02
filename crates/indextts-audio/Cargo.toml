@@ -1,0 +1,20 @@
+[package]
+name = "indextts-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Audio processing for IndexTTS-2.5"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+indextts-core = { workspace = true }
+thiserror = { workspace = true }
+hound = { workspace = true }
+rayon = "1.10"
+
+[dev-dependencies]
+tempfile.workspace = true

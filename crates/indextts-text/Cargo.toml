@@ -1,0 +1,21 @@
+[package]
+name = "indextts-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Text normalization for IndexTTS-2.5"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+indextts-core = { workspace = true }
+indextts-tokenizer = { workspace = true }
+thiserror = { workspace = true }
+regex = "1.11"
+lazy_static = "1.5"
+
+[dev-dependencies]
+proptest = { workspace = true }

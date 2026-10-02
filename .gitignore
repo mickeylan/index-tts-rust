@@ -1,0 +1,64 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+!**/Cargo.lock
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.dll
+*.so
+*.dylib
+*.exe
+
+# Model weights (must not be committed)
+checkpoints/
+hf_cache/
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Test fixtures with potential model data
+tests/fixtures/weights/
+tests/fixtures/checkpoints/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# Documentation build
+docs/_build/
+site/
+
+# Coverage
+*.profraw
+coverage/
+
+# Temporary audio files
+*.wav
+*.flac
+*.mp3
+!tests/**/*
+
+# ONNX models (if any local copies)
+*.onnx
+!schemas/*
