@@ -16,6 +16,14 @@ pub enum WeightError {
     NotImplemented(String),
     #[error("Missing weight: {0}")]
     MissingWeight(String),
+    #[error("Tensor error: {0}")]
+    Tensor(String),
+    #[error("Shape mismatch for {name}: actual {actual:?}, expected {expected:?}")]
+    ShapeMismatch {
+        name: String,
+        actual: Vec<usize>,
+        expected: Vec<usize>,
+    },
 }
 
 /// Weight storage
@@ -27,16 +35,18 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// Load from safetensors file
-    /// 
-    /// Note: This is a placeholder. Full implementation requires:
-    /// 1. Using torch crate for .pth files
-    /// 2. Using onnxruntime for ONNX models
-    /// 3. Converting PyTorch models to safetensors via Python
-    pub fn load(_path: &Path, device: &Device) -> Result<Self, WeightError> {
-        // Placeholder implementation
+    /// Load tensors from a safetensors file using Candle's dtype-aware loader.
+    pub fn load(path: &Path, device: &Device) -> Result<Self, WeightError> {
+        if !path.is_file() {
+            return Err(WeightError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("weight file not found: {}", path.display()),
+            )));
+        }
+        let tensors = candle_core::safetensors::load(path, device)
+            .map_err(|error| WeightError::Tensor(error.to_string()))?;
         Ok(Self {
-            tensors: HashMap::new(),
+            tensors,
             device: device.clone(),
         })
     }
@@ -77,12 +87,11 @@ impl Weights {
             let tensor = self.tensors.get(&spec.name)
                 .ok_or_else(|| WeightError::MissingWeight(spec.name.clone()))?;
             if tensor.dims() != spec.shape.as_slice() {
-                return Err(WeightError::NotImplemented(format!(
-                    "weight {} has shape {:?}, expected {:?}",
-                    spec.name,
-                    tensor.dims(),
-                    spec.shape,
-                )));
+                return Err(WeightError::ShapeMismatch {
+                    name: spec.name,
+                    actual: tensor.dims().to_vec(),
+                    expected: spec.shape,
+                });
             }
         }
         Ok(())
