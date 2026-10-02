@@ -17,6 +17,7 @@ indextts-tokenizer = { workspace = true }
 indextts-audio = { workspace = true }
 indextts-gpt = { workspace = true }
 indextts-ort = { workspace = true }
+candle-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }

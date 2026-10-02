@@ -15,8 +15,10 @@ use indextts_core::{
     AudioBuffer, DeviceConfig, GenerationConfig, Language,
     ModelConfig, Result as TtsResult, SemanticCodes, SpeakerCondition,
 };
+use candle_core::{Device, Tensor as CandleTensor};
+use indextts_gpt::{Generator, GptConfig, GreedyGenerator, IndexGpt};
 use indextts_text::TextNormalizer;
-use indextts_tokenizer::IndexTtsTokenizer;
+use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
 use indextts_audio::{campplus_fbank, process_reference_audio, seamless_m4t_features, save_wav};
 use indextts_ort::{run_campplus, run_gpt_conditioning, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
 use std::path::{Path, PathBuf};
@@ -103,6 +105,75 @@ impl ReferenceEncoder {
             reference_samples_22k: audio_22k.samples.len(),
         })
     }
+}
+
+/// Runtime for reference-audio + text to greedy semantic codes.
+#[derive(Debug)]
+pub struct SemanticRuntime {
+    reference: ReferenceEncoder,
+    tokenizer: IndexTtsTokenizer,
+    normalizer: TextNormalizer,
+    gpt: IndexGpt,
+}
+
+impl SemanticRuntime {
+    pub fn load(model_dir: &Path) -> TtsResult<Self> {
+        let device = Device::Cpu;
+        let mut gpt = IndexGpt::new(GptConfig::default(), device)
+            .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
+        gpt.load_weights(&model_dir.join("gpt.safetensors"))
+            .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
+        Ok(Self {
+            reference: ReferenceEncoder::load(model_dir)?,
+            tokenizer: IndexTtsTokenizer::from_dir(model_dir)?,
+            normalizer: TextNormalizer::new(),
+            gpt,
+        })
+    }
+
+    pub fn generate(
+        &mut self,
+        text: &str,
+        language: Language,
+        reference_audio: &Path,
+        max_tokens: usize,
+    ) -> TtsResult<SemanticCodes> {
+        if text.trim().is_empty() {
+            return Err(indextts_core::IndexTtsError::InvalidText("text is empty".into()));
+        }
+        let normalized = self.normalizer.normalize(text, language)?;
+        let tokens = self.tokenizer.tokenize_for_gpt(&normalized, language)?;
+        let reference = self.reference.encode(reference_audio)?;
+        let conditioning = ort_f32_to_candle(&reference.gpt_conditioning, self.gpt.device())?;
+        let prefix = self.gpt.build_prefix(&conditioning, &tokens, language_token_id(language))
+            .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+        let dummy_text = CandleTensor::zeros((1, 0), candle_core::DType::U32, self.gpt.device())
+            .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+        let (input_ids, attention_mask) = self.gpt.prepare_inputs(&prefix, &dummy_text, None)
+            .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+        let input_len = input_ids.dim(1)
+            .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+        let mut generator = GreedyGenerator::new(
+            self.gpt.device(),
+            input_len + max_tokens + 1,
+        );
+        let output = generator.generate(
+            &self.gpt,
+            &input_ids,
+            Some(&attention_mask),
+            input_len + max_tokens - 1,
+        ).map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+        if output.tokens.is_empty() {
+            return Err(indextts_core::IndexTtsError::EmptySemanticCodes);
+        }
+        Ok(SemanticCodes::new(output.tokens))
+    }
+}
+
+fn ort_f32_to_candle(tensor: &Tensor, device: &Device) -> TtsResult<CandleTensor> {
+    let shape: Vec<usize> = tensor.shape().iter().map(|dimension| *dimension as usize).collect();
+    CandleTensor::from_slice(tensor.as_slice(), shape, device)
+        .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))
 }
 
 /// IndexTTS Pipeline (placeholder)
