@@ -2,7 +2,7 @@
 
 use candle_core::{D, Device, Module, Result as CandleResult, Tensor};
 
-use crate::embedding::{LayerNorm, Linear};
+use crate::{cache::KvCache, embedding::{LayerNorm, Linear}};
 
 /// GPT-2 self-attention. Official Hugging Face Conv1D matrices are accepted
 /// in their checkpoint layout `[in, out]` and transposed once at construction.
@@ -48,33 +48,55 @@ impl Gpt2Attention {
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> CandleResult<Tensor> {
+        self.forward_inner(hidden_states, None)
+    }
+
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        layer_idx: usize,
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        self.forward_inner(hidden_states, Some((layer_idx, cache)))
+    }
+
+    fn forward_inner(
+        &self,
+        hidden_states: &Tensor,
+        cache: Option<(usize, &mut KvCache)>,
+    ) -> CandleResult<Tensor> {
         let c_attn = self.c_attn.as_ref()
             .ok_or_else(|| candle_core::Error::Msg("attention weights are not loaded".into()))?;
         let c_proj = self.c_proj.as_ref()
             .ok_or_else(|| candle_core::Error::Msg("attention weights are not loaded".into()))?;
-        let (batch, seq_len, n_embd) = hidden_states.dims3()?;
+        let (batch, query_len, n_embd) = hidden_states.dims3()?;
         let qkv = c_attn.forward(hidden_states)?;
         let query = qkv.narrow(2, 0, n_embd)?;
         let key = qkv.narrow(2, n_embd, n_embd)?;
         let value = qkv.narrow(2, 2 * n_embd, n_embd)?;
 
         let split = |tensor: Tensor| -> CandleResult<Tensor> {
-            tensor.reshape((batch, seq_len, self.n_head, self.head_dim))?
+            tensor.reshape((batch, query_len, self.n_head, self.head_dim))?
                 .permute((0, 2, 1, 3))
         };
         let query = split(query)?;
         let key = split(key)?;
         let value = split(value)?;
+        let (key, value) = match cache {
+            Some((layer_idx, cache)) => cache.update(layer_idx, &key, &value)?,
+            None => (key, value),
+        };
+        let key_len = key.dim(2)?;
 
         let scores = query.matmul(&key.transpose(2, 3)?)?
             .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?;
-        let mask = create_causal_mask(seq_len, scores.device())?
-            .reshape((1, 1, seq_len, seq_len))?;
+        let mask = create_causal_mask_for_lengths(query_len, key_len, scores.device())?
+            .reshape((1, 1, query_len, key_len))?;
         let scores = scores.broadcast_add(&mask)?;
         let probabilities = candle_nn::ops::softmax(&scores, D::Minus1)?;
         let context = probabilities.matmul(&value)?
             .permute((0, 2, 1, 3))?
-            .reshape((batch, seq_len, n_embd))?;
+            .reshape((batch, query_len, n_embd))?;
         c_proj.forward(&context)
     }
 
@@ -179,11 +201,31 @@ impl Gpt2Block {
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> CandleResult<Tensor> {
+        self.forward_inner(hidden_states, None)
+    }
+
+    pub fn forward_with_cache(
+        &self,
+        hidden_states: &Tensor,
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        self.forward_inner(hidden_states, Some(cache))
+    }
+
+    fn forward_inner(
+        &self,
+        hidden_states: &Tensor,
+        cache: Option<&mut KvCache>,
+    ) -> CandleResult<Tensor> {
         let ln_1 = self.ln_1.as_ref()
             .ok_or_else(|| candle_core::Error::Msg("block weights are not loaded".into()))?;
         let ln_2 = self.ln_2.as_ref()
             .ok_or_else(|| candle_core::Error::Msg("block weights are not loaded".into()))?;
-        let attention = self.attn.forward(&ln_1.forward(hidden_states)?)?;
+        let normalized = ln_1.forward(hidden_states)?;
+        let attention = match cache {
+            Some(cache) => self.attn.forward_with_cache(&normalized, self.layer_idx, cache)?,
+            None => self.attn.forward(&normalized)?,
+        };
         let hidden_states = (hidden_states + attention)?;
         let feed_forward = self.mlp.forward(&ln_2.forward(&hidden_states)?)?;
         hidden_states + feed_forward
@@ -191,10 +233,26 @@ impl Gpt2Block {
 }
 
 pub fn create_causal_mask(seq_len: usize, device: &Device) -> CandleResult<Tensor> {
-    let mask: Vec<f32> = (0..seq_len)
-        .flat_map(|row| (0..seq_len).map(move |column| if column <= row { 0.0 } else { f32::MIN }))
+    create_causal_mask_for_lengths(seq_len, seq_len, device)
+}
+
+pub fn create_causal_mask_for_lengths(
+    query_len: usize,
+    key_len: usize,
+    device: &Device,
+) -> CandleResult<Tensor> {
+    if query_len > key_len {
+        candle_core::bail!("query length {query_len} exceeds key length {key_len}")
+    }
+    let past_len = key_len - query_len;
+    let mask: Vec<f32> = (0..query_len)
+        .flat_map(|row| {
+            (0..key_len).map(move |column| {
+                if column <= past_len + row { 0.0 } else { f32::MIN }
+            })
+        })
         .collect();
-    Tensor::from_slice(&mask, (seq_len, seq_len), device)
+    Tensor::from_slice(&mask, (query_len, key_len), device)
 }
 
 #[cfg(test)]
@@ -255,5 +313,13 @@ mod tests {
         assert_eq!(mask[0][0], 0.0);
         assert!(mask[0][1] < -1e30);
         assert_eq!(mask[1], vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn decode_mask_can_attend_to_entire_cache() {
+        let device = Device::Cpu;
+        let mask = create_causal_mask_for_lengths(1, 4, &device)
+            .unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(mask, vec![vec![0.0, 0.0, 0.0, 0.0]]);
     }
 }

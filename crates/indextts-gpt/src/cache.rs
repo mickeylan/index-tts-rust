@@ -1,6 +1,6 @@
 //! KV Cache implementation for efficient generation
 
-use candle_core::{Tensor, Device, DType, Result as CandleResult};
+use candle_core::{Device, Result as CandleResult, Tensor};
 use std::collections::HashMap;
 
 /// Key-Value cache for transformer layers
@@ -49,6 +49,20 @@ impl KvCache {
 
     /// Update cache with new key-value pairs
     pub fn update(&mut self, layer: usize, new_key: &Tensor, new_value: &Tensor) -> CandleResult<(Tensor, Tensor)> {
+        if !new_key.device().same_device(&self.device) || !new_value.device().same_device(&self.device) {
+            candle_core::bail!("KV cache tensors must be on the cache device")
+        }
+        if new_key.dims() != new_value.dims() {
+            candle_core::bail!("KV key/value shapes differ: {:?} vs {:?}", new_key.dims(), new_value.dims())
+        }
+        let new_len = new_key.dim(2)?;
+        if self.seq_len() + new_len > self.max_seq_len {
+            candle_core::bail!(
+                "KV cache length {} exceeds configured maximum {}",
+                self.seq_len() + new_len,
+                self.max_seq_len
+            )
+        }
         let key_name = format!("layer_{}", layer);
         let value_name = format!("layer_{}", layer);
         
@@ -56,16 +70,12 @@ impl KvCache {
             self.keys.get(&key_name),
             self.values.get(&value_name)
         ) {
-            // Concatenate along sequence dimension
             let key = candle_core::Tensor::cat(&[existing_key, new_key], 2)?;
             let value = candle_core::Tensor::cat(&[existing_value, new_value], 2)?;
-            
             self.keys.insert(key_name, key.clone());
             self.values.insert(value_name, value.clone());
-            
             Ok((key, value))
         } else {
-            // First entry
             self.keys.insert(key_name, new_key.clone());
             self.values.insert(value_name, new_value.clone());
             Ok((new_key.clone(), new_value.clone()))
@@ -81,7 +91,7 @@ impl KvCache {
             return None;
         }
         
-        let mut tensors: Vec<Tensor> = layers
+        let tensors: Vec<Tensor> = layers
             .iter()
             .filter_map(|k| self.keys.get(*k).cloned())
             .collect();
@@ -103,7 +113,7 @@ impl KvCache {
             return None;
         }
         
-        let mut tensors: Vec<Tensor> = layers
+        let tensors: Vec<Tensor> = layers
             .iter()
             .filter_map(|v| self.values.get(*v).cloned())
             .collect();
@@ -181,5 +191,14 @@ mod tests {
         let device = Device::Cpu;
         let mask = create_causal_mask(10, &device).unwrap();
         assert_eq!(mask.dims(), &[10, 10]);
+    }
+
+    #[test]
+    fn cache_rejects_sequences_beyond_limit() {
+        let device = Device::Cpu;
+        let mut cache = KvCache::new(1, device.clone());
+        let key = Tensor::zeros((1, 1, 2, 1), candle_core::DType::F32, &device).unwrap();
+        let error = cache.update(0, &key, &key).unwrap_err();
+        assert!(error.to_string().contains("exceeds configured maximum"));
     }
 }
