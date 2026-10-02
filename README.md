@@ -108,9 +108,8 @@ func main() {
 - ✅ Real 24-layer Attention/MLP/LayerNorm forward pass
 - ✅ Prefill and incremental KV-cache decode
 - ✅ Greedy generation control loop
-- ✅ Python/Rust first-token parity
-- ✅ Python/Rust first 8 greedy semantic tokens are identical
-- 🔲 Full sequence parity through EOS
+- ✅ Python/Rust first-token logits agree (`max_abs_error=2.5749207e-5` on the fixed CPU fixture)
+- ✅ Full greedy sequence parity: all 45 semantic codes and EOS position are identical
 - 🔲 Checked-in compact regression fixture (model weights remain external)
 
 ### Later generation modes
@@ -119,7 +118,7 @@ func main() {
 - 🔲 Beam search implementation
 
 ### Next Steps
-- 🔲 Full Python/Rust semantic-code sequence parity through EOS
+- 🔲 Add a distributable parity fixture and automated external-model test
 - 🔲 ONNX backend integration
 - 🔲 End-to-end pipeline completion
 

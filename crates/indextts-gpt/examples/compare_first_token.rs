@@ -18,6 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expected_codes: Vec<u32> = serde_json::from_value(
         metadata.get("semantic_codes").cloned().ok_or("metadata missing semantic_codes")?
     )?;
+    let expected_eos = metadata.get("reached_eos")
+        .and_then(|value| value.as_bool()).unwrap_or(false);
 
     let mut model = IndexGpt::new(GptConfig::default(), device.clone())?;
     model.load_weights(&weights_path)?;
@@ -41,12 +43,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut generator = GreedyGenerator::new(model.device(), model.config().n_positions);
-    let max_length = fake_ids.dim(1)? + expected_codes.len() - 1;
+    let max_length = fake_ids.dim(1)? + expected_codes.len();
     let generated = generator.generate(&model, &fake_ids, None, max_length)?;
     println!("expected_codes={expected_codes:?}");
     println!("actual_codes={:?}", generated.tokens);
     if generated.tokens != expected_codes {
         return Err("greedy semantic code mismatch".into());
+    }
+    println!("expected_eos={expected_eos}");
+    println!("actual_eos={}", generated.stopped);
+    if generated.stopped != expected_eos {
+        return Err("EOS termination mismatch".into());
+    }
+    if expected_eos && generated.stop_position != Some(expected_codes.len()) {
+        return Err("EOS position mismatch".into());
     }
     Ok(())
 }

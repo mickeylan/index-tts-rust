@@ -54,12 +54,14 @@ def main() -> None:
     logits = output.logits[:, -1, :].float().contiguous()
     first_token = int(torch.argmax(logits, dim=-1).item())
     semantic_codes: list[int] = []
+    reached_eos = False
     current = output
     current_mask = attention_mask
     with torch.no_grad():
         for _ in range(args.steps):
             token = int(torch.argmax(current.logits[:, -1, :], dim=-1).item())
             if token == config.gpt.stop_mel_token:
+                reached_eos = True
                 break
             semantic_codes.append(token)
             current_mask = torch.nn.functional.pad(current_mask, (0, 1), value=1)
@@ -86,6 +88,8 @@ def main() -> None:
         "language": 0,
         "first_token": first_token,
         "semantic_codes": semantic_codes,
+        "reached_eos": reached_eos,
+        "eos_position": len(semantic_codes) if reached_eos else None,
         "prefix_shape": list(prefix.shape),
         "fake_ids_shape": list(fake_ids.shape),
         "logits_shape": list(logits.shape),
