@@ -14,6 +14,7 @@ categories.workspace = true
 indextts-core = { workspace = true }
 thiserror = { workspace = true }
 hound = { workspace = true }
+rubato = { workspace = true }
 rayon = "1.10"
 
 [dev-dependencies]

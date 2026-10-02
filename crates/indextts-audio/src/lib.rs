@@ -8,6 +8,7 @@
 //! - PCM/WAV output
 
 use indextts_core::{AudioBuffer, IndexTtsError, Result};
+use rubato::{FftFixedInOut, Resampler};
 use std::path::Path;
 
 /// Default sample rate for IndexTTS (22.05 kHz)
@@ -151,18 +152,56 @@ pub fn process_reference_audio(path: &Path) -> Result<(AudioBuffer, AudioBuffer)
         }
     }
     
-    // For now, return the same audio (no resampling)
-    // TODO: Add proper resampling using rubato
-    let audio_22050 = if audio.sample_rate != INDEXTTS_SAMPLE_RATE {
-        // Placeholder: would need resampling
-        audio.clone()
-    } else {
-        audio.clone()
-    };
-    
-    let audio_16000 = audio; // Placeholder: would need resampling
-    
+    validate_audio(&audio).map_err(|error| {
+        IndexTtsError::InvalidReferenceAudio(error.to_string())
+    })?;
+
+    let audio_16000 = resample_mono(&audio, WAV2VEC_SAMPLE_RATE)?;
+    let audio_22050 = resample_mono(&audio, INDEXTTS_SAMPLE_RATE)?;
     Ok((audio_16000, audio_22050))
+}
+
+/// Resample a mono audio buffer with Rubato's band-limited FFT resampler.
+pub fn resample_mono(audio: &AudioBuffer, target_rate: u32) -> Result<AudioBuffer> {
+    if audio.sample_rate == target_rate {
+        return Ok(audio.clone());
+    }
+    if audio.sample_rate == 0 || target_rate == 0 || audio.samples.is_empty() {
+        return Err(IndexTtsError::InvalidAudio(
+            "cannot resample empty audio or a zero sample rate".into(),
+        ));
+    }
+
+    let mut resampler = FftFixedInOut::<f32>::new(
+        audio.sample_rate as usize,
+        target_rate as usize,
+        1024,
+        1,
+    ).map_err(|error| IndexTtsError::InvalidAudio(format!("resampler setup failed: {error}")))?;
+    let delay = resampler.output_delay();
+    let expected_len = ((audio.samples.len() as u64 * target_rate as u64
+        + audio.sample_rate as u64 / 2) / audio.sample_rate as u64) as usize;
+    let mut remaining = audio.samples.as_slice();
+    let mut output = Vec::with_capacity(expected_len + delay);
+
+    while remaining.len() >= resampler.input_frames_next() {
+        let input = [remaining];
+        let chunk = resampler.process(&input, None)
+            .map_err(|error| IndexTtsError::InvalidAudio(format!("resampling failed: {error}")))?;
+        remaining = &remaining[resampler.input_frames_next()..];
+        output.extend_from_slice(&chunk[0]);
+    }
+    if !remaining.is_empty() {
+        let input = [remaining];
+        let chunk = resampler.process_partial(Some(&input), None)
+            .map_err(|error| IndexTtsError::InvalidAudio(format!("resampling tail failed: {error}")))?;
+        output.extend_from_slice(&chunk[0]);
+    }
+
+    let end = (delay + expected_len).min(output.len());
+    let mut samples = output.get(delay..end).unwrap_or_default().to_vec();
+    samples.resize(expected_len, 0.0);
+    Ok(AudioBuffer::new(samples, target_rate))
 }
 
 /// Validate audio buffer
@@ -255,5 +294,19 @@ mod tests {
         assert_eq!(WAV2VEC_SAMPLE_RATE, 16000);
         assert_eq!(MAX_REFERENCE_DURATION, 15.0);
         assert_eq!(MIN_REFERENCE_DURATION, 0.25);
+    }
+
+    #[test]
+    fn resampling_produces_exact_target_length_and_rate() {
+        let source_rate = 48_000;
+        let samples: Vec<f32> = (0..source_rate)
+            .map(|index| (2.0 * std::f32::consts::PI * 440.0 * index as f32 / source_rate as f32).sin() * 0.5)
+            .collect();
+        let source = AudioBuffer::new(samples, source_rate);
+        let output = resample_mono(&source, WAV2VEC_SAMPLE_RATE).unwrap();
+        assert_eq!(output.sample_rate, WAV2VEC_SAMPLE_RATE);
+        assert_eq!(output.samples.len(), WAV2VEC_SAMPLE_RATE as usize);
+        assert!(output.samples.iter().all(|sample| sample.is_finite()));
+        assert!(output.samples.iter().map(|sample| sample.abs()).fold(0.0, f32::max) > 0.4);
     }
 }
