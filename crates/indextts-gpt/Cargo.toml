@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 indextts-core = { workspace = true }
 candle-core = { workspace = true }
+candle-nn = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

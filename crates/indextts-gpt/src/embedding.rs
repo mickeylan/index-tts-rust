@@ -2,7 +2,7 @@
 //!
 //! This module implements the embedding layers for the IndexTTS-2.5 GPT model.
 
-use candle_core::{Tensor, Result as CandleResult, Device, DType};
+use candle_core::{Device, Module, Result as CandleResult, Tensor};
 
 /// Text embedding layer
 #[derive(Debug, Clone)]
@@ -23,9 +23,16 @@ impl TextEmbedding {
     /// 
     /// Input: (batch, seq_len) token IDs
     /// Output: (batch, seq_len, dim) embeddings
-    pub fn forward(&self, _ids: &Tensor, _weight: &Tensor) -> CandleResult<Tensor> {
-        // TODO: Implement actual embedding lookup
-        candle_core::bail!("Text embedding forward not implemented")
+    pub fn forward(&self, ids: &Tensor, weight: &Tensor) -> CandleResult<Tensor> {
+        if weight.dims() != [self.num_tokens, self.dim] {
+            candle_core::bail!(
+                "text embedding weight shape {:?}, expected [{}, {}]",
+                weight.dims(),
+                self.num_tokens,
+                self.dim
+            )
+        }
+        candle_nn::Embedding::new(weight.clone(), self.dim).forward(ids)
     }
 }
 
@@ -45,9 +52,16 @@ impl LearnedPositionEmbedding {
     }
 
     /// Forward pass
-    pub fn forward(&self, _position_ids: &Tensor, _weight: &Tensor) -> CandleResult<Tensor> {
-        // TODO: Implement actual position embedding lookup
-        candle_core::bail!("Position embedding forward not implemented")
+    pub fn forward(&self, position_ids: &Tensor, weight: &Tensor) -> CandleResult<Tensor> {
+        if weight.dims() != [self.max_len, self.dim] {
+            candle_core::bail!(
+                "position embedding weight shape {:?}, expected [{}, {}]",
+                weight.dims(),
+                self.max_len,
+                self.dim
+            )
+        }
+        candle_nn::Embedding::new(weight.clone(), self.dim).forward(position_ids)
     }
 }
 
@@ -76,9 +90,11 @@ impl LayerNorm {
 
     /// Forward pass
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        // TODO: Implement actual layer norm
-        // LayerNorm(x) = (x - mean) / sqrt(variance + eps) * weight + bias
-        Ok(x.clone())
+        let bias = match &self.bias {
+            Some(bias) => bias.clone(),
+            None => Tensor::zeros(self.weight.dims(), self.weight.dtype(), self.weight.device())?,
+        };
+        candle_nn::LayerNorm::new(self.weight.clone(), bias, self.eps as f64).forward(x)
     }
 }
 
@@ -99,8 +115,7 @@ impl Linear {
 
     /// Forward pass: y = x @ W^T + b
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        // TODO: Implement actual linear projection
-        Ok(x.clone())
+        candle_nn::Linear::new(self.weight.clone(), self.bias.clone()).forward(x)
     }
 }
 
@@ -138,8 +153,8 @@ impl GptEmbeddings {
         let text_emb = self.text_emb.forward(input_ids, text_weight)?;
         let pos_emb = self.pos_emb.forward(&pos_ids, pos_weight)?;
         
-        // Add embeddings
-        (text_emb + pos_emb)
+        // Add embeddings.
+        text_emb + pos_emb
     }
 }
 
@@ -156,8 +171,36 @@ mod tests {
 
     #[test]
     fn test_text_embedding() {
-        let emb = TextEmbedding::new(60509, 1280);
-        assert_eq!(emb.num_tokens, 60509);
-        assert_eq!(emb.dim, 1280);
+        let device = Device::Cpu;
+        let emb = TextEmbedding::new(3, 2);
+        let weight = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], &device).unwrap();
+        let ids = Tensor::new(&[[2u32, 0]], &device).unwrap();
+        let output = emb.forward(&ids, &weight).unwrap();
+        assert_eq!(output.dims(), &[1, 2, 2]);
+        assert_eq!(output.to_vec3::<f32>().unwrap(), vec![vec![vec![5., 6.], vec![1., 2.]]]);
+    }
+
+    #[test]
+    fn test_linear_uses_pytorch_layout() {
+        let device = Device::Cpu;
+        let weight = Tensor::new(&[[1f32, 0.], [0., 2.], [1., 1.]], &device).unwrap();
+        let bias = Tensor::new(&[1f32, -1., 0.5], &device).unwrap();
+        let linear = Linear::new(weight, Some(bias));
+        let input = Tensor::new(&[[2f32, 3.]], &device).unwrap();
+        assert_eq!(linear.forward(&input).unwrap().to_vec2::<f32>().unwrap(), vec![vec![3., 5., 5.5]]);
+    }
+
+    #[test]
+    fn test_layer_norm_matches_expected_values() {
+        let device = Device::Cpu;
+        let norm = LayerNorm::new(
+            Tensor::ones(2, candle_core::DType::F32, &device).unwrap(),
+            Some(Tensor::zeros(2, candle_core::DType::F32, &device).unwrap()),
+            1e-5,
+        );
+        let input = Tensor::new(&[[1f32, 3.]], &device).unwrap();
+        let output = norm.forward(&input).unwrap().to_vec2::<f32>().unwrap();
+        assert!((output[0][0] + 1.0).abs() < 1e-4);
+        assert!((output[0][1] - 1.0).abs() < 1e-4);
     }
 }
