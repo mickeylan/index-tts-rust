@@ -245,7 +245,7 @@ mod tests {
         let model = IndexGpt::new(config, device).unwrap();
         let params = model.num_parameters();
         // IndexTTS-2.5 has ~1.2B parameters
-        println!("Model parameters: {:,}", params);
+        eprintln!("Model parameters: {}", params);
         assert!(params > 500_000_000); // At least 500M
     }
 
