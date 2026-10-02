@@ -111,9 +111,16 @@ func main() {
 - ✅ Speaker conditioning encoder framework (CAMPPlus, Perceiver)
 - ✅ YAML config loading
 - ✅ Generation strategies documented
+- ✅ GPT2 Attention, MLP, Block structures
+- ✅ Weight loading utilities framework
+- ✅ Expected weight names documented
+
+### Phase 1.5: Weight Loading (In Progress)
+- 🔲 Safetensors weight loading
+- 🔲 PyTorch checkpoint support
+- 🔲 Weight validation and shape checking
 
 ### Next Steps
-- 🔲 Weight loading (safetensors/PyTorch)
 - 🔲 Full GPT forward pass implementation
 - 🔲 Python baseline parity testing
 - 🔲 ONNX backend integration
