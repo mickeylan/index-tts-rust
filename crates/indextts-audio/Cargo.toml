@@ -15,6 +15,7 @@ indextts-core = { workspace = true }
 thiserror = { workspace = true }
 hound = { workspace = true }
 rubato = { workspace = true }
+rustfft = "6.4"
 rayon = "1.10"
 
 [dev-dependencies]

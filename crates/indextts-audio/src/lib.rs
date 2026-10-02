@@ -9,6 +9,7 @@
 
 use indextts_core::{AudioBuffer, IndexTtsError, Result};
 use rubato::{FftFixedInOut, Resampler};
+use rustfft::{num_complex::Complex, FftPlanner};
 use std::path::Path;
 
 /// Default sample rate for IndexTTS (22.05 kHz)
@@ -204,6 +205,115 @@ pub fn resample_mono(audio: &AudioBuffer, target_rate: u32) -> Result<AudioBuffe
     Ok(AudioBuffer::new(samples, target_rate))
 }
 
+/// Features consumed by the Wav2Vec2-BERT ONNX graph.
+#[derive(Debug, Clone)]
+pub struct SeamlessM4tFeatures {
+    pub input_features: Vec<f32>,
+    pub attention_mask: Vec<i64>,
+    pub frames: usize,
+}
+
+/// Reproduce Hugging Face `SeamlessM4TFeatureExtractor` for one 16 kHz waveform.
+pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures> {
+    if audio.sample_rate != WAV2VEC_SAMPLE_RATE {
+        return Err(IndexTtsError::InvalidAudio(format!(
+            "SeamlessM4T requires 16000 Hz audio, got {}", audio.sample_rate
+        )));
+    }
+    const FRAME: usize = 400;
+    const HOP: usize = 160;
+    const FFT: usize = 512;
+    const BINS: usize = FFT / 2 + 1;
+    const MELS: usize = 80;
+    if audio.samples.len() < FRAME {
+        return Err(IndexTtsError::InvalidAudio("audio is too short for one feature frame".into()));
+    }
+    let raw_frames = 1 + (audio.samples.len() - FRAME) / HOP;
+    let frames = raw_frames - raw_frames % 2;
+    if frames < 2 {
+        return Err(IndexTtsError::InvalidAudio("audio is too short after stride-2 stacking".into()));
+    }
+
+    let window: Vec<f64> = (0..FRAME).map(|index| {
+        let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (FRAME - 1) as f64).cos();
+        hann.powf(0.85)
+    }).collect();
+    let mel_min = 1127.0f64 * (1.0f64 + 20.0 / 700.0).ln();
+    let mel_max = 1127.0f64 * (1.0f64 + 8000.0 / 700.0).ln();
+    let mel_points: Vec<f64> = (0..MELS + 2)
+        .map(|index| mel_min + (mel_max - mel_min) * index as f64 / (MELS + 1) as f64)
+        .collect();
+    let fft_mels: Vec<f64> = (0..BINS).map(|index| {
+        let hz = WAV2VEC_SAMPLE_RATE as f64 / FFT as f64 * index as f64;
+        1127.0 * (1.0 + hz / 700.0).ln()
+    }).collect();
+
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(FFT);
+    let mut mel_frames = vec![0f32; frames * MELS];
+    let mut buffer = vec![Complex::new(0.0, 0.0); FFT];
+    for frame_index in 0..frames {
+        buffer.fill(Complex::new(0.0, 0.0));
+        let offset = frame_index * HOP;
+        let mean = audio.samples[offset..offset + FRAME].iter()
+            .map(|value| *value as f64 * 32768.0).sum::<f64>() / FRAME as f64;
+        let mut previous = audio.samples[offset] as f64 * 32768.0 - mean;
+        buffer[0].re = previous * (1.0 - 0.97) * window[0];
+        for index in 1..FRAME {
+            let current = audio.samples[offset + index] as f64 * 32768.0 - mean;
+            buffer[index].re = (current - 0.97 * previous) * window[index];
+            previous = current;
+        }
+        fft.process(&mut buffer);
+        for mel in 0..MELS {
+            let left = mel_points[mel];
+            let center = mel_points[mel + 1];
+            let right = mel_points[mel + 2];
+            let mut energy = 0.0f64;
+            for bin in 0..BINS {
+                let frequency = fft_mels[bin];
+                let weight = if frequency >= left && frequency <= center {
+                    (frequency - left) / (center - left)
+                } else if frequency > center && frequency <= right {
+                    (right - frequency) / (right - center)
+                } else { 0.0 };
+                energy += buffer[bin].norm_sqr() * weight;
+            }
+            mel_frames[frame_index * MELS + mel] = energy.max(f32::EPSILON as f64).ln() as f32;
+        }
+    }
+
+    // Normalize each mel channel using sample variance (ddof=1).
+    for mel in 0..MELS {
+        let mean = (0..frames).map(|frame| mel_frames[frame * MELS + mel] as f64)
+            .sum::<f64>() / frames as f64;
+        let variance = (0..frames).map(|frame| {
+            let delta = mel_frames[frame * MELS + mel] as f64 - mean;
+            delta * delta
+        }).sum::<f64>() / (frames - 1) as f64;
+        let scale = (variance + 1e-7).sqrt();
+        for frame in 0..frames {
+            mel_frames[frame * MELS + mel] =
+                ((mel_frames[frame * MELS + mel] as f64 - mean) / scale) as f32;
+        }
+    }
+
+    // Stride-2 stacking: [T, 80] -> [T/2, 160].
+    let stacked_frames = frames / 2;
+    let mut input_features = vec![0f32; stacked_frames * 160];
+    for frame in 0..stacked_frames {
+        input_features[frame * 160..frame * 160 + 80]
+            .copy_from_slice(&mel_frames[(frame * 2) * 80..(frame * 2 + 1) * 80]);
+        input_features[frame * 160 + 80..(frame + 1) * 160]
+            .copy_from_slice(&mel_frames[(frame * 2 + 1) * 80..(frame * 2 + 2) * 80]);
+    }
+    Ok(SeamlessM4tFeatures {
+        input_features,
+        attention_mask: vec![1; stacked_frames],
+        frames: stacked_frames,
+    })
+}
+
 /// Validate audio buffer
 pub fn validate_audio(audio: &AudioBuffer) -> Result<()> {
     if audio.samples.is_empty() {
@@ -308,5 +418,38 @@ mod tests {
         assert_eq!(output.samples.len(), WAV2VEC_SAMPLE_RATE as usize);
         assert!(output.samples.iter().all(|sample| sample.is_finite()));
         assert!(output.samples.iter().map(|sample| sample.abs()).fold(0.0, f32::max) > 0.4);
+    }
+
+    #[test]
+    fn seamless_features_have_expected_shape_and_normalization() {
+        let samples: Vec<f32> = (0..WAV2VEC_SAMPLE_RATE)
+            .map(|index| {
+                let time = index as f32 / WAV2VEC_SAMPLE_RATE as f32;
+                0.3 * (2.0 * std::f32::consts::PI * 220.0 * time).sin()
+                    + 0.1 * (2.0 * std::f32::consts::PI * 630.0 * time).sin()
+            })
+            .collect();
+        let features = seamless_m4t_features(&AudioBuffer::new(samples, WAV2VEC_SAMPLE_RATE)).unwrap();
+        assert_eq!(features.frames, 49);
+        assert_eq!(features.input_features.len(), 49 * 160);
+        assert_eq!(features.attention_mask, vec![1; 49]);
+        assert!(features.input_features.iter().all(|value| value.is_finite()));
+        let official = [
+            (0, 0.90362066f32),
+            (1, 0.80721146),
+            (79, -3.3372314),
+            (80, -0.2189388),
+            (159, -2.5282848),
+            (160, 0.40543014),
+            (777, -1.7934725),
+            (7839, 0.6679816),
+        ];
+        for (index, expected) in official {
+            assert!(
+                (features.input_features[index] - expected).abs() < 1e-2,
+                "feature {index}: Rust={}, Python={expected}",
+                features.input_features[index]
+            );
+        }
     }
 }

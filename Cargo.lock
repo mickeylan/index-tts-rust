@@ -709,6 +709,7 @@ dependencies = [
  "indextts-core",
  "rayon",
  "rubato",
+ "rustfft",
  "tempfile",
  "thiserror 2.0.21",
 ]
