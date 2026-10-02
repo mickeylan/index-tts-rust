@@ -429,7 +429,7 @@ def export_length_regulator(source: Path, model_dir: Path, output: Path) -> None
         raise RuntimeError(f"length regulator dynamic parity failed: {dynamic_error}")
 
 
-def export_dit(source: Path, model_dir: Path, output: Path) -> None:
+def export_dit(source: Path, model_dir: Path, output: Path, frames: int) -> None:
     _, model = load_s2mel(source, model_dir)
     estimator = model.models["cfm"].estimator
     estimator.setup_caches(max_batch_size=2, max_seq_length=8192)
@@ -458,8 +458,10 @@ def export_dit(source: Path, model_dir: Path, output: Path) -> None:
         except ValueError:
             pass
 
+    if frames < 64 or frames > 8192:
+        raise ValueError("fixed DiT frame bucket must be in [64, 8192]")
     torch.manual_seed(1234)
-    batch, frames = 2, 64
+    batch = 2
     x = torch.randn(batch, 80, frames)
     prompt = torch.randn(batch, 80, frames)
     lengths = torch.full((batch,), frames, dtype=torch.long)
@@ -476,11 +478,13 @@ def export_dit(source: Path, model_dir: Path, output: Path) -> None:
             str(output),
             input_names=["x", "prompt_x", "x_lens", "t", "style", "condition"],
             output_names=["velocity"],
+            # Time is intentionally fixed. The current PyTorch model contains
+            # shape-dependent WaveNet padding which cannot be exported safely
+            # as a symbolic dimension. Runtime selects and pads to a bucket.
             dynamic_axes={
-                "x": {0: "batch", 2: "frames"}, "prompt_x": {0: "batch", 2: "frames"},
+                "x": {0: "batch"}, "prompt_x": {0: "batch"},
                 "x_lens": {0: "batch"}, "t": {0: "batch"}, "style": {0: "batch"},
-                "condition": {0: "batch", 1: "frames"},
-                "velocity": {0: "batch", 2: "frames"},
+                "condition": {0: "batch"}, "velocity": {0: "batch"},
             },
             opset_version=17,
             dynamo=False,
@@ -516,6 +520,7 @@ def main() -> None:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--frames", type=int, default=256, help="fixed DiT frame bucket")
     args = parser.parse_args()
 
     if args.component == "campplus":
@@ -529,7 +534,7 @@ def main() -> None:
     elif args.component == "length-regulator":
         export_length_regulator(args.source, args.model_dir, args.output)
     elif args.component == "dit":
-        export_dit(args.source, args.model_dir, args.output)
+        export_dit(args.source, args.model_dir, args.output, args.frames)
 
 
 if __name__ == "__main__":
