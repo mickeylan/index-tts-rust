@@ -66,9 +66,26 @@ impl Weights {
         self.tensors.is_empty()
     }
 
-    /// Insert a weight
+    /// Insert a weight.
     pub fn insert(&mut self, name: String, tensor: Tensor) {
         self.tensors.insert(name, tensor);
+    }
+
+    /// Validate all tensors needed by the greedy semantic GPT path.
+    pub fn validate_greedy_contract(&self) -> Result<(), WeightError> {
+        for spec in greedy_gpt_weight_specs() {
+            let tensor = self.tensors.get(&spec.name)
+                .ok_or_else(|| WeightError::MissingWeight(spec.name.clone()))?;
+            if tensor.dims() != spec.shape.as_slice() {
+                return Err(WeightError::NotImplemented(format!(
+                    "weight {} has shape {:?}, expected {:?}",
+                    spec.name,
+                    tensor.dims(),
+                    spec.shape,
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -116,37 +133,51 @@ pub fn print_weight_info(loaded: &LoadedWeights) {
     }
 }
 
-/// Expected weight names for IndexTTS-2.5 GPT
-#[allow(dead_code)]
-pub fn expected_gpt_weights() -> Vec<String> {
-    let mut names = Vec::new();
-    
-    // Embeddings
-    names.push("wte.weight".to_string());  // Text embedding
-    names.push("wpe.weight".to_string());  // Position embedding
-    
-    // Transformer layers (24 layers)
-    for i in 0..24 {
-        names.push(format!("h.{}.attn.c_attn.weight", i));
-        names.push(format!("h.{}.attn.c_attn.bias", i));
-        names.push(format!("h.{}.attn.c_proj.weight", i));
-        names.push(format!("h.{}.attn.c_proj.bias", i));
-        names.push(format!("h.{}.ln_1.weight", i));
-        names.push(format!("h.{}.ln_1.bias", i));
-        names.push(format!("h.{}.mlp.c_fc.weight", i));
-        names.push(format!("h.{}.mlp.c_fc.bias", i));
-        names.push(format!("h.{}.mlp.c_proj.weight", i));
-        names.push(format!("h.{}.mlp.c_proj.bias", i));
-        names.push(format!("h.{}.ln_2.weight", i));
-        names.push(format!("h.{}.ln_2.bias", i));
+/// One required tensor in the IndexTTS-2.5 greedy GPT contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightSpec {
+    pub name: String,
+    pub shape: Vec<usize>,
+    /// PyTorch `Conv1D` stores matrices as `[in, out]`; regular linear
+    /// layers and embeddings use their native PyTorch layouts.
+    pub conv1d_input_major: bool,
+}
+
+/// Exact tensors required when prefix conditioning/text embeddings are
+/// supplied by the caller and Rust only performs semantic-token generation.
+pub fn greedy_gpt_weight_specs() -> Vec<WeightSpec> {
+    let mut specs = vec![
+        WeightSpec { name: "mel_embedding.weight".into(), shape: vec![8194, 1280], conv1d_input_major: false },
+        WeightSpec { name: "mel_pos_embedding.emb.weight".into(), shape: vec![1818, 1280], conv1d_input_major: false },
+    ];
+
+    for layer in 0..24 {
+        let prefix = format!("gpt.h.{layer}");
+        specs.extend([
+            WeightSpec { name: format!("{prefix}.ln_1.weight"), shape: vec![1280], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.ln_1.bias"), shape: vec![1280], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.attn.c_attn.weight"), shape: vec![1280, 3840], conv1d_input_major: true },
+            WeightSpec { name: format!("{prefix}.attn.c_attn.bias"), shape: vec![3840], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.attn.c_proj.weight"), shape: vec![1280, 1280], conv1d_input_major: true },
+            WeightSpec { name: format!("{prefix}.attn.c_proj.bias"), shape: vec![1280], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.ln_2.weight"), shape: vec![1280], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.ln_2.bias"), shape: vec![1280], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.mlp.c_fc.weight"), shape: vec![1280, 5120], conv1d_input_major: true },
+            WeightSpec { name: format!("{prefix}.mlp.c_fc.bias"), shape: vec![5120], conv1d_input_major: false },
+            WeightSpec { name: format!("{prefix}.mlp.c_proj.weight"), shape: vec![5120, 1280], conv1d_input_major: true },
+            WeightSpec { name: format!("{prefix}.mlp.c_proj.bias"), shape: vec![1280], conv1d_input_major: false },
+        ]);
     }
-    
-    // Final layers
-    names.push("ln_f.weight".to_string());
-    names.push("ln_f.bias".to_string());
-    names.push("lm_head.weight".to_string());
-    
-    names
+
+    specs.extend([
+        WeightSpec { name: "gpt.ln_f.weight".into(), shape: vec![1280], conv1d_input_major: false },
+        WeightSpec { name: "gpt.ln_f.bias".into(), shape: vec![1280], conv1d_input_major: false },
+        WeightSpec { name: "final_norm.weight".into(), shape: vec![1280], conv1d_input_major: false },
+        WeightSpec { name: "final_norm.bias".into(), shape: vec![1280], conv1d_input_major: false },
+        WeightSpec { name: "mel_head.weight".into(), shape: vec![8194, 1280], conv1d_input_major: false },
+        WeightSpec { name: "mel_head.bias".into(), shape: vec![8194], conv1d_input_major: false },
+    ]);
+    specs
 }
 
 #[cfg(test)]
@@ -165,9 +196,32 @@ mod tests {
     }
 
     #[test]
-    fn test_expected_weights() {
-        let names = expected_gpt_weights();
-        // Should have ~300+ weight names
-        assert!(names.len() > 100);
+    fn greedy_contract_matches_official_architecture() {
+        let specs = greedy_gpt_weight_specs();
+        assert_eq!(specs.len(), 296);
+        assert_eq!(specs[0].name, "mel_embedding.weight");
+        assert_eq!(specs[0].shape, vec![8194, 1280]);
+
+        let qkv = specs.iter()
+            .find(|spec| spec.name == "gpt.h.0.attn.c_attn.weight")
+            .unwrap();
+        assert_eq!(qkv.shape, vec![1280, 3840]);
+        assert!(qkv.conv1d_input_major);
+
+        assert!(!specs.iter().any(|spec| spec.name == "wte.weight"));
+        assert!(!specs.iter().any(|spec| spec.name == "wpe.weight"));
+    }
+
+    #[test]
+    fn empty_weights_report_first_required_tensor() {
+        let weights = Weights {
+            tensors: HashMap::new(),
+            device: Device::Cpu,
+        };
+        let error = weights.validate_greedy_contract().unwrap_err();
+        assert!(matches!(
+            error,
+            WeightError::MissingWeight(name) if name == "mel_embedding.weight"
+        ));
     }
 }
