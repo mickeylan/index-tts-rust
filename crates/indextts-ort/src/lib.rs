@@ -1,242 +1,239 @@
-//! ONNX Runtime wrapper for IndexTTS-2.5
-//!
-//! Provides:
-//! - ONNX Session caching
-//! - CUDA Execution Provider management
-//! - Dynamic shape handling
-//! - Input/output name validation
-//! - Error mapping
-//!
-//! **Note**: This is a simplified placeholder implementation.
-//! Full ONNX Runtime integration requires matching the exact ort crate version API.
+//! ONNX Runtime integration for the non-autoregressive IndexTTS-2.5 stages.
 
 use indextts_core::{IndexTtsError, Result};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use once_cell::sync::Lazy;
+use ort::{
+    session::{Session, SessionInputValue},
+    value::{DynTensor, Tensor as OrtTensor},
+};
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
-/// Placeholder for ONNX tensor
-#[derive(Debug, Clone)]
-pub struct Tensor {
-    data: Vec<f32>,
-    shape: Vec<i64>,
+/// Owned host tensor accepted by the runtime wrapper.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tensor {
+    F32 { data: Vec<f32>, shape: Vec<i64> },
+    I64 { data: Vec<i64>, shape: Vec<i64> },
 }
 
 impl Tensor {
     pub fn new(data: Vec<f32>, shape: Vec<i64>) -> Self {
-        Self { data, shape }
+        Self::F32 { data, shape }
+    }
+
+    pub fn new_i64(data: Vec<i64>, shape: Vec<i64>) -> Self {
+        Self::I64 { data, shape }
     }
 
     pub fn shape(&self) -> &[i64] {
-        &self.shape
+        match self {
+            Self::F32 { shape, .. } | Self::I64 { shape, .. } => shape,
+        }
     }
 
     pub fn as_slice(&self) -> &[f32] {
-        &self.data
+        match self {
+            Self::F32 { data, .. } => data,
+            Self::I64 { .. } => panic!("requested f32 data from an i64 tensor"),
+        }
+    }
+
+    pub fn as_i64_slice(&self) -> &[i64] {
+        match self {
+            Self::I64 { data, .. } => data,
+            Self::F32 { .. } => panic!("requested i64 data from an f32 tensor"),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.shape().iter().any(|dimension| *dimension < 0) {
+            return Err(IndexTtsError::BackendFailure(format!(
+                "runtime tensor has a negative shape: {:?}", self.shape()
+            )));
+        }
+        let expected = self.shape().iter().try_fold(1usize, |count, dimension| {
+            count.checked_mul(*dimension as usize)
+        }).ok_or_else(|| IndexTtsError::BackendFailure("runtime tensor shape overflow".into()))?;
+        let actual = match self {
+            Self::F32 { data, .. } => data.len(),
+            Self::I64 { data, .. } => data.len(),
+        };
+        if actual != expected {
+            return Err(IndexTtsError::BackendFailure(format!(
+                "runtime tensor has {actual} values but shape {:?} requires {expected}", self.shape()
+            )));
+        }
+        Ok(())
+    }
+
+    fn into_ort(self) -> Result<DynTensor> {
+        self.validate()?;
+        match self {
+            Self::F32 { data, shape } => OrtTensor::from_array((shape, data))
+                .map(|tensor| tensor.upcast())
+                .map_err(ort_error),
+            Self::I64 { data, shape } => OrtTensor::from_array((shape, data))
+                .map(|tensor| tensor.upcast())
+                .map_err(ort_error),
+        }
     }
 }
 
-/// ONNX Runtime error
-#[derive(Debug, Clone)]
-pub enum OrtError {
-    Runtime(String),
-    SessionNotFound(String),
-    InvalidInput(String),
-    InvalidOutput(String),
+fn ort_error(error: ort::Error) -> IndexTtsError {
+    IndexTtsError::BackendFailure(format!("ONNX Runtime: {error}"))
 }
 
-/// ONNX model session wrapper
+/// Thread-safe handle. `ort::Session::run` is serialized because ORT requires
+/// mutable access and some execution-provider internals are not thread-safe.
 #[derive(Debug, Clone)]
 pub struct OnnxSession {
-    /// Model path
     path: PathBuf,
-    /// Input names
+    inner: Arc<Mutex<Session>>,
     input_names: Vec<String>,
-    /// Output names
     output_names: Vec<String>,
 }
 
-/// ONNX session cache
-#[derive(Debug, Default)]
-pub struct SessionCache {
-    /// Cache of loaded sessions
-    sessions: std::collections::HashMap<PathBuf, OnnxSession>,
-}
-
-impl SessionCache {
-    /// Get or load a session
-    pub fn get(&self, path: &Path) -> Result<OnnxSession> {
-        let path = path.to_path_buf();
-        
-        // Try to get from cache
-        if let Some(session) = self.sessions.get(&path) {
-            return Ok(session.clone());
-        }
-        
-        // Load session (placeholder - requires actual ONNX Runtime integration)
-        let session = OnnxSession::load(path.as_path())?;
-        Ok(session)
-    }
-
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        self.sessions.clear();
-    }
-
-    /// Get number of cached sessions
-    pub fn len(&self) -> usize {
-        self.sessions.len()
-    }
-
-    /// Check if cache is empty
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
-}
-
-/// Global session cache
-static SESSION_CACHE: Lazy<Mutex<SessionCache>> = Lazy::new(|| {
-    Mutex::new(SessionCache::default())
-});
-
 impl OnnxSession {
-    /// Load an ONNX session from file (placeholder)
     pub fn load(path: &Path) -> Result<Self> {
-        // TODO: Implement actual ONNX Runtime session loading
-        // This requires matching the exact ort crate API version
-        
-        // For now, just return a placeholder session
+        if !path.is_file() {
+            return Err(IndexTtsError::InvalidModel(format!(
+                "ONNX model not found: {}", path.display()
+            )));
+        }
+        let session = Session::builder().map_err(ort_error)?
+            .commit_from_file(path).map_err(ort_error)?;
+        let input_names = session.inputs().iter().map(|input| input.name().to_owned()).collect();
+        let output_names = session.outputs().iter().map(|output| output.name().to_owned()).collect();
         Ok(Self {
             path: path.to_path_buf(),
-            input_names: vec!["input".to_string()],
-            output_names: vec!["output".to_string()],
+            inner: Arc::new(Mutex::new(session)),
+            input_names,
+            output_names,
         })
     }
 
-    /// Run inference (placeholder)
-    #[allow(clippy::type_complexity)]
-    pub fn run<IT, OT>(&self, _inputs: IT, _outputs: OT) -> Result<Vec<Tensor>>
+    pub fn path(&self) -> &Path { &self.path }
+    pub fn input_names(&self) -> &[String] { &self.input_names }
+    pub fn output_names(&self) -> &[String] { &self.output_names }
+    pub fn has_input(&self, name: &str) -> bool { self.input_names.iter().any(|item| item == name) }
+    pub fn has_output(&self, name: &str) -> bool { self.output_names.iter().any(|item| item == name) }
+
+    pub fn run<IT, OT>(&self, inputs: IT, requested_outputs: OT) -> Result<Vec<Tensor>>
     where
         IT: IntoIterator<Item = (String, Tensor)>,
         OT: IntoIterator<Item = String>,
     {
-        // TODO: Implement actual ONNX Runtime inference
-        Err(IndexTtsError::BackendFailure(
-            "ONNX Runtime inference not yet implemented".into()
-        ))
+        let inputs: Vec<(String, SessionInputValue<'static>)> = inputs.into_iter()
+            .map(|(name, tensor)| Ok((name, SessionInputValue::from(tensor.into_ort()?))))
+            .collect::<Result<_>>()?;
+        for (name, _) in &inputs {
+            if !self.has_input(name) {
+                return Err(IndexTtsError::BackendFailure(format!(
+                    "model {} has no input named {name}; available: {:?}",
+                    self.path.display(), self.input_names
+                )));
+            }
+        }
+        let requested: Vec<String> = requested_outputs.into_iter().collect();
+        for name in &requested {
+            if !self.has_output(name) {
+                return Err(IndexTtsError::BackendFailure(format!(
+                    "model {} has no output named {name}; available: {:?}",
+                    self.path.display(), self.output_names
+                )));
+            }
+        }
+
+        let mut session = self.inner.lock().map_err(|_| {
+            IndexTtsError::BackendFailure("ONNX Runtime session lock was poisoned".into())
+        })?;
+        let outputs = session.run(inputs).map_err(ort_error)?;
+        let names = if requested.is_empty() { self.output_names.clone() } else { requested };
+        names.into_iter().map(|name| {
+            let value = outputs.get(&name).ok_or_else(|| {
+                IndexTtsError::BackendFailure(format!("ONNX Runtime omitted output {name}"))
+            })?;
+            if let Ok((shape, data)) = value.try_extract_tensor::<f32>() {
+                return Ok(Tensor::F32 { data: data.to_vec(), shape: shape.iter().copied().collect() });
+            }
+            if let Ok((shape, data)) = value.try_extract_tensor::<i64>() {
+                return Ok(Tensor::I64 { data: data.to_vec(), shape: shape.iter().copied().collect() });
+            }
+            Err(IndexTtsError::BackendFailure(format!(
+                "output {name} is not a supported f32/i64 CPU tensor"
+            )))
+        }).collect()
     }
 
-    /// Run inference with tensors (placeholder)
-    pub fn run_tensors(
-        &self,
-        _input_tensors: Vec<(&str, Tensor)>,
-        _output_names: Vec<String>,
-    ) -> Result<Vec<Tensor>> {
-        Err(IndexTtsError::BackendFailure(
-            "ONNX Runtime inference not yet implemented".into()
-        ))
-    }
-
-    /// Get input names
-    pub fn input_names(&self) -> &[String] {
-        &self.input_names
-    }
-
-    /// Get output names
-    pub fn output_names(&self) -> &[String] {
-        &self.output_names
-    }
-
-    /// Validate input exists
-    pub fn has_input(&self, name: &str) -> bool {
-        self.input_names.iter().any(|n| n == name)
-    }
-
-    /// Validate output exists
-    pub fn has_output(&self, name: &str) -> bool {
-        self.output_names.iter().any(|n| n == name)
+    pub fn run_tensors(&self, inputs: Vec<(&str, Tensor)>, outputs: Vec<String>) -> Result<Vec<Tensor>> {
+        self.run(inputs.into_iter().map(|(name, tensor)| (name.to_owned(), tensor)), outputs)
     }
 }
 
-/// IndexTTS ONNX models
+#[derive(Debug, Default)]
+pub struct SessionCache {
+    sessions: HashMap<PathBuf, OnnxSession>,
+}
+
+impl SessionCache {
+    pub fn get(&mut self, path: &Path) -> Result<OnnxSession> {
+        let path = path.to_path_buf();
+        if let Some(session) = self.sessions.get(&path) {
+            return Ok(session.clone());
+        }
+        let session = OnnxSession::load(&path)?;
+        self.sessions.insert(path, session.clone());
+        Ok(session)
+    }
+    pub fn clear(&mut self) { self.sessions.clear(); }
+    pub fn len(&self) -> usize { self.sessions.len() }
+    pub fn is_empty(&self) -> bool { self.sessions.is_empty() }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnnxModel {
-    /// Wav2Vec2-BERT semantic encoder
     Wav2Vec2Bert,
-    /// CAMPPlus speaker verification
     Campplus,
-    /// Speaker conditioner
     SpeakerConditioner,
-    /// Emotion conditioner
     EmotionConditioner,
-    /// Semantic codec
     SemanticCodec,
-    /// Length regulator
     LengthRegulator,
-    /// S2Mel DiT diffusion
     S2Mel,
-    /// BigVGAN vocoder
     BigVGAN,
 }
 
 impl OnnxModel {
-    /// Get the expected file name for this model
-    pub fn filename(&self) -> &'static str {
-        match self {
-            OnnxModel::Wav2Vec2Bert => "model.onnx",
-            OnnxModel::Campplus => "model.onnx",
-            OnnxModel::SpeakerConditioner => "model.onnx",
-            OnnxModel::EmotionConditioner => "model.onnx",
-            OnnxModel::SemanticCodec => "model.onnx",
-            OnnxModel::LengthRegulator => "model.onnx",
-            OnnxModel::S2Mel => "model.onnx",
-            OnnxModel::BigVGAN => "model.onnx",
-        }
-    }
-
-    /// Get the subdirectory for this model
+    pub fn filename(&self) -> &'static str { "model.onnx" }
     pub fn subdir(&self) -> &'static str {
         match self {
-            OnnxModel::Wav2Vec2Bert => "wav2vec2bert",
-            OnnxModel::Campplus => "campplus",
-            OnnxModel::SpeakerConditioner => "speaker-conditioner",
-            OnnxModel::EmotionConditioner => "emotion-conditioner",
-            OnnxModel::SemanticCodec => "semantic-codec",
-            OnnxModel::LengthRegulator => "length-regulator",
-            OnnxModel::S2Mel => "s2mel",
-            OnnxModel::BigVGAN => "bigvgan",
+            Self::Wav2Vec2Bert => "wav2vec2bert",
+            Self::Campplus => "campplus",
+            Self::SpeakerConditioner => "speaker-conditioner",
+            Self::EmotionConditioner => "emotion-conditioner",
+            Self::SemanticCodec => "semantic-codec",
+            Self::LengthRegulator => "length-regulator",
+            Self::S2Mel => "s2mel",
+            Self::BigVGAN => "bigvgan",
         }
     }
-
-    /// Get the full path for this model
     pub fn path(&self, model_dir: &Path) -> PathBuf {
         model_dir.join("hf_cache").join(self.subdir()).join(self.filename())
     }
 }
 
-/// Helper to run Wav2Vec2-BERT encoding (placeholder)
-pub fn run_wav2vec2bert(
-    _session: &OnnxSession,
-    _audio_samples: &[f32],
-    _sample_rate: u32,
-) -> Result<Tensor> {
-    Err(IndexTtsError::BackendFailure(
-        "Wav2Vec2-BERT inference not yet implemented".into()
-    ))
+pub fn run_wav2vec2bert(session: &OnnxSession, features: Tensor, mask: Tensor) -> Result<Tensor> {
+    session.run_tensors(
+        vec![("input_features", features), ("attention_mask", mask)],
+        vec!["hidden_states_17".into()],
+    )?.into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing Wav2Vec2-BERT output".into()))
 }
 
-/// Helper to run CAMPPlus speaker encoding (placeholder)
-pub fn run_campplus(_session: &OnnxSession, _audio_features: &[f32]) -> Result<Tensor> {
-    Err(IndexTtsError::BackendFailure(
-        "CAMPPlus inference not yet implemented".into()
-    ))
+pub fn run_campplus(session: &OnnxSession, features: Tensor) -> Result<Tensor> {
+    session.run_tensors(vec![("x", features)], vec!["style".into()])?
+        .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing CAMPPlus output".into()))
 }
 
-/// Helper to run BigVGAN vocoder (placeholder)
-pub fn run_bigvgan(_session: &OnnxSession, _mel_spec: &[f32]) -> Result<Tensor> {
-    Err(IndexTtsError::BackendFailure(
-        "BigVGAN inference not yet implemented".into()
-    ))
+pub fn run_bigvgan(session: &OnnxSession, mel: Tensor) -> Result<Tensor> {
+    session.run_tensors(vec![("mel", mel)], vec!["audio".into()])?
+        .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing BigVGAN output".into()))
 }
 
 #[cfg(test)]
@@ -246,15 +243,8 @@ mod tests {
     #[test]
     fn test_onnx_model_paths() {
         let model_dir = Path::new("/models/index-tts");
-        
-        assert_eq!(
-            OnnxModel::Wav2Vec2Bert.path(model_dir),
-            Path::new("/models/index-tts/hf_cache/wav2vec2bert/model.onnx")
-        );
-        assert_eq!(
-            OnnxModel::BigVGAN.path(model_dir),
-            Path::new("/models/index-tts/hf_cache/bigvgan/model.onnx")
-        );
+        assert_eq!(OnnxModel::Wav2Vec2Bert.path(model_dir), Path::new("/models/index-tts/hf_cache/wav2vec2bert/model.onnx"));
+        assert_eq!(OnnxModel::BigVGAN.path(model_dir), Path::new("/models/index-tts/hf_cache/bigvgan/model.onnx"));
     }
 
     #[test]
@@ -269,5 +259,12 @@ mod tests {
         let tensor = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3]);
         assert_eq!(tensor.shape(), &[1, 3]);
         assert_eq!(tensor.as_slice(), &[1.0, 2.0, 3.0]);
+        tensor.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_tensor_shape() {
+        let tensor = Tensor::new_i64(vec![1, 2], vec![1, 3]);
+        assert!(tensor.validate().is_err());
     }
 }

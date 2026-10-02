@@ -15,6 +15,8 @@ indextts-core = { workspace = true }
 thiserror = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+ort = { workspace = true }
+ndarray = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
