@@ -155,9 +155,110 @@ def export_wav2vec2bert(model_dir: Path, output: Path) -> None:
         )
 
 
+def export_gpt_conditioning(source: Path, model_dir: Path, output: Path) -> None:
+    sys.path.insert(0, str(source.resolve()))
+    from omegaconf import OmegaConf
+    from torch import nn
+    from indextts.gpt.model_v2 import UnifiedVoice
+    from indextts.utils.checkpoint import load_checkpoint
+
+    config = OmegaConf.load(model_dir / "config.yaml")
+    model = UnifiedVoice(**config.gpt, use_accel=False, spk_cond_mode="campplus")
+    load_checkpoint(model, str(model_dir / config.gpt_checkpoint))
+    model.eval()
+
+    class GptConditioning(nn.Module):
+        def __init__(self, unified_voice):
+            super().__init__()
+            self.speaker_projection = unified_voice.spk_emb_proj
+            self.emotion_encoder = unified_voice.emo_conditioning_encoder
+            self.emotion_perceiver = unified_voice.emo_perceiver_encoder
+            self.emovec_layer = unified_voice.emovec_layer
+            self.emo_layer = unified_voice.emo_layer
+
+        def forward(self, speaker_style, semantic_features):
+            # Match model_v2.merge_emovec: infer_v2_5 passes shape[-1]
+            # (the 1024 feature width) as the conditioning length.
+            semantic_lengths = torch.full(
+                (semantic_features.shape[0],),
+                semantic_features.shape[-1],
+                dtype=torch.long,
+                device=semantic_features.device,
+            )
+            encoded, mask = self.emotion_encoder(semantic_features, semantic_lengths)
+            perceiver_mask = torch.nn.functional.pad(mask.squeeze(1), (1, 0), value=True)
+            emotion = self.emotion_perceiver(encoded, perceiver_mask).squeeze(1)
+            emotion = self.emo_layer(self.emovec_layer(emotion))
+            speaker = self.speaker_projection(speaker_style)
+            first = speaker + emotion
+            zeros = torch.zeros(
+                first.shape[0], 2, first.shape[1], dtype=first.dtype, device=first.device
+            )
+            return torch.cat((first.unsqueeze(1), zeros), dim=1)
+
+    wrapper = GptConditioning(model).eval()
+    torch.manual_seed(1234)
+    speaker = torch.randn(1, 192)
+    semantic = torch.randn(1, 49, 1024)
+    with torch.no_grad():
+        expected = wrapper(speaker, semantic).cpu().numpy()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (speaker, semantic),
+        str(output),
+        input_names=["speaker_style", "semantic_features"],
+        output_names=["conditioning"],
+        dynamic_axes={
+            "speaker_style": {0: "batch"},
+            "semantic_features": {0: "batch", 1: "frames"},
+            "conditioning": {0: "batch"},
+        },
+        opset_version=17,
+        dynamo=False,
+    )
+
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    actual = session.run(
+        ["conditioning"],
+        {
+            "speaker_style": speaker.numpy(),
+            "semantic_features": semantic.numpy(),
+        },
+    )[0]
+    difference = np.abs(expected - actual)
+    max_error = float(np.max(difference))
+    mean_error = float(np.mean(difference))
+    print(
+        f"gpt_conditioning output_shape={list(actual.shape)} "
+        f"max_abs_error={max_error:.9g} mean_abs_error={mean_error:.9g}"
+    )
+    if max_error > 0.003 or mean_error > 2e-5:
+        raise RuntimeError(
+            f"GPT conditioning ONNX parity failed: max={max_error}, mean={mean_error}"
+        )
+
+    # The reference duration is dynamic. Validate a second frame count so
+    # TorchScript tracing cannot silently freeze the example length.
+    semantic_dynamic = torch.randn(1, 63, 1024)
+    with torch.no_grad():
+        expected_dynamic = wrapper(speaker, semantic_dynamic).cpu().numpy()
+    actual_dynamic = session.run(
+        ["conditioning"],
+        {"speaker_style": speaker.numpy(), "semantic_features": semantic_dynamic.numpy()},
+    )[0]
+    dynamic_error = float(np.max(np.abs(expected_dynamic - actual_dynamic)))
+    print(f"gpt_conditioning dynamic_frames=63 max_abs_error={dynamic_error:.9g}")
+    if dynamic_error > 0.003:
+        raise RuntimeError(f"GPT conditioning dynamic-shape parity failed: {dynamic_error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("component", choices=["campplus", "wav2vec2bert"]) 
+    parser.add_argument("component", choices=["campplus", "wav2vec2bert", "gpt-conditioning"]) 
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -167,6 +268,8 @@ def main() -> None:
         export_campplus(args.source, args.model_dir, args.output)
     elif args.component == "wav2vec2bert":
         export_wav2vec2bert(args.model_dir, args.output)
+    elif args.component == "gpt-conditioning":
+        export_gpt_conditioning(args.source, args.model_dir, args.output)
 
 
 if __name__ == "__main__":

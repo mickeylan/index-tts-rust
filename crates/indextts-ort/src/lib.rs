@@ -194,6 +194,7 @@ pub enum OnnxModel {
     Campplus,
     SpeakerConditioner,
     EmotionConditioner,
+    GptConditioning,
     SemanticCodec,
     LengthRegulator,
     S2Mel,
@@ -208,6 +209,7 @@ impl OnnxModel {
             Self::Campplus => "campplus",
             Self::SpeakerConditioner => "speaker-conditioner",
             Self::EmotionConditioner => "emotion-conditioner",
+            Self::GptConditioning => "gpt-conditioning",
             Self::SemanticCodec => "semantic-codec",
             Self::LengthRegulator => "length-regulator",
             Self::S2Mel => "s2mel",
@@ -276,6 +278,19 @@ impl Wav2VecStats {
 pub fn run_campplus(session: &OnnxSession, features: Tensor) -> Result<Tensor> {
     session.run_tensors(vec![("x", features)], vec!["style".into()])?
         .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing CAMPPlus output".into()))
+}
+
+pub fn run_gpt_conditioning(
+    session: &OnnxSession,
+    speaker_style: Tensor,
+    semantic_features: Tensor,
+) -> Result<Tensor> {
+    session.run_tensors(
+        vec![("speaker_style", speaker_style), ("semantic_features", semantic_features)],
+        vec!["conditioning".into()],
+    )?.into_iter().next().ok_or_else(|| {
+        IndexTtsError::BackendFailure("missing GPT conditioning output".into())
+    })
 }
 
 pub fn run_bigvgan(session: &OnnxSession, mel: Tensor) -> Result<Tensor> {

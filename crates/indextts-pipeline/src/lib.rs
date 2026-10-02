@@ -18,7 +18,7 @@ use indextts_core::{
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::IndexTtsTokenizer;
 use indextts_audio::{campplus_fbank, process_reference_audio, seamless_m4t_features, save_wav};
-use indextts_ort::{run_campplus, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
+use indextts_ort::{run_campplus, run_gpt_conditioning, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn, instrument};
 
@@ -29,6 +29,8 @@ pub struct ReferenceConditioning {
     pub semantic: Tensor,
     /// CAMPPlus speaker style `[1, 192]`.
     pub speaker_style: Tensor,
+    /// Three GPT conditioning tokens `[1, 3, 1280]`.
+    pub gpt_conditioning: Tensor,
     /// Number of 22.05 kHz samples retained for reference-mel generation.
     pub reference_samples_22k: usize,
 }
@@ -38,6 +40,7 @@ pub struct ReferenceConditioning {
 pub struct ReferenceEncoder {
     wav2vec: OnnxSession,
     campplus: OnnxSession,
+    gpt_conditioning: OnnxSession,
     stats: Wav2VecStats,
 }
 
@@ -46,6 +49,7 @@ impl ReferenceEncoder {
         Ok(Self {
             wav2vec: OnnxSession::load(&OnnxModel::Wav2Vec2Bert.path(model_dir))?,
             campplus: OnnxSession::load(&OnnxModel::Campplus.path(model_dir))?,
+            gpt_conditioning: OnnxSession::load(&OnnxModel::GptConditioning.path(model_dir))?,
             stats: Wav2VecStats::load(&model_dir.join("wav2vec2bert_stats.safetensors"))?,
         })
     }
@@ -72,6 +76,11 @@ impl ReferenceEncoder {
             &self.campplus,
             Tensor::new(fbank, vec![1, fbank_frames as i64, 80]),
         )?;
+        let gpt_conditioning = run_gpt_conditioning(
+            &self.gpt_conditioning,
+            speaker_style.clone(),
+            semantic.clone(),
+        )?;
         if semantic.shape().first() != Some(&1) || semantic.shape().last() != Some(&1024) {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
                 "invalid semantic conditioning shape {:?}", semantic.shape()
@@ -82,9 +91,15 @@ impl ReferenceEncoder {
                 "invalid speaker style shape {:?}", speaker_style.shape()
             )));
         }
+        if gpt_conditioning.shape() != [1, 3, 1280] {
+            return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+                "invalid GPT conditioning shape {:?}", gpt_conditioning.shape()
+            )));
+        }
         Ok(ReferenceConditioning {
             semantic,
             speaker_style,
+            gpt_conditioning,
             reference_samples_22k: audio_22k.samples.len(),
         })
     }
