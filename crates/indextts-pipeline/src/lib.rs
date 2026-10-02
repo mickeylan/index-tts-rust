@@ -17,9 +17,78 @@ use indextts_core::{
 };
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::IndexTtsTokenizer;
-use indextts_audio::{process_reference_audio, save_wav};
+use indextts_audio::{campplus_fbank, process_reference_audio, seamless_m4t_features, save_wav};
+use indextts_ort::{run_campplus, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn, instrument};
+
+/// Features extracted from a user-provided reference voice.
+#[derive(Debug, Clone)]
+pub struct ReferenceConditioning {
+    /// Normalized Wav2Vec2-BERT hidden state `[1, semantic_frames, 1024]`.
+    pub semantic: Tensor,
+    /// CAMPPlus speaker style `[1, 192]`.
+    pub speaker_style: Tensor,
+    /// Number of 22.05 kHz samples retained for reference-mel generation.
+    pub reference_samples_22k: usize,
+}
+
+/// Runtime for the two reference-audio encoder branches.
+#[derive(Debug)]
+pub struct ReferenceEncoder {
+    wav2vec: OnnxSession,
+    campplus: OnnxSession,
+    stats: Wav2VecStats,
+}
+
+impl ReferenceEncoder {
+    pub fn load(model_dir: &Path) -> TtsResult<Self> {
+        Ok(Self {
+            wav2vec: OnnxSession::load(&OnnxModel::Wav2Vec2Bert.path(model_dir))?,
+            campplus: OnnxSession::load(&OnnxModel::Campplus.path(model_dir))?,
+            stats: Wav2VecStats::load(&model_dir.join("wav2vec2bert_stats.safetensors"))?,
+        })
+    }
+
+    pub fn encode(&self, reference_audio: &Path) -> TtsResult<ReferenceConditioning> {
+        let (audio_16k, audio_22k) = process_reference_audio(reference_audio)?;
+        let seamless = seamless_m4t_features(&audio_16k)?;
+        let semantic = run_wav2vec2bert(
+            &self.wav2vec,
+            Tensor::new(
+                seamless.input_features,
+                vec![1, seamless.frames as i64, 160],
+            ),
+            Tensor::new_i64(
+                seamless.attention_mask,
+                vec![1, seamless.frames as i64],
+            ),
+        )?;
+        let semantic = self.stats.normalize(semantic)?;
+
+        let fbank = campplus_fbank(&audio_16k)?;
+        let fbank_frames = fbank.len() / 80;
+        let speaker_style = run_campplus(
+            &self.campplus,
+            Tensor::new(fbank, vec![1, fbank_frames as i64, 80]),
+        )?;
+        if semantic.shape().first() != Some(&1) || semantic.shape().last() != Some(&1024) {
+            return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+                "invalid semantic conditioning shape {:?}", semantic.shape()
+            )));
+        }
+        if speaker_style.shape() != [1, 192] {
+            return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+                "invalid speaker style shape {:?}", speaker_style.shape()
+            )));
+        }
+        Ok(ReferenceConditioning {
+            semantic,
+            speaker_style,
+            reference_samples_22k: audio_22k.samples.len(),
+        })
+    }
+}
 
 /// IndexTTS Pipeline (placeholder)
 #[derive(Debug)]

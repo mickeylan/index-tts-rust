@@ -215,7 +215,7 @@ impl OnnxModel {
         }
     }
     pub fn path(&self, model_dir: &Path) -> PathBuf {
-        model_dir.join("hf_cache").join(self.subdir()).join(self.filename())
+        model_dir.join("onnx").join(self.subdir()).join(self.filename())
     }
 }
 
@@ -290,8 +290,8 @@ mod tests {
     #[test]
     fn test_onnx_model_paths() {
         let model_dir = Path::new("/models/index-tts");
-        assert_eq!(OnnxModel::Wav2Vec2Bert.path(model_dir), Path::new("/models/index-tts/hf_cache/wav2vec2bert/model.onnx"));
-        assert_eq!(OnnxModel::BigVGAN.path(model_dir), Path::new("/models/index-tts/hf_cache/bigvgan/model.onnx"));
+        assert_eq!(OnnxModel::Wav2Vec2Bert.path(model_dir), Path::new("/models/index-tts/onnx/wav2vec2bert/model.onnx"));
+        assert_eq!(OnnxModel::BigVGAN.path(model_dir), Path::new("/models/index-tts/onnx/bigvgan/model.onnx"));
     }
 
     #[test]
