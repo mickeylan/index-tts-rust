@@ -17,6 +17,12 @@ pub struct IndexGpt {
     config: GptConfig,
     device: Device,
     cached_prefix: Option<Tensor>,
+    text_embedding: TextEmbedding,
+    text_embedding_weight: Option<Tensor>,
+    text_position: LearnedPositionEmbedding,
+    text_position_weight: Option<Tensor>,
+    language_embedding: TextEmbedding,
+    language_embedding_weight: Option<Tensor>,
     mel_embedding: TextEmbedding,
     mel_embedding_weight: Option<Tensor>,
     mel_position: LearnedPositionEmbedding,
@@ -34,6 +40,12 @@ impl IndexGpt {
         let num_params = Self::calculate_params(&config);
         let mel_positions = config.max_mel_tokens + 3;
         Ok(Self {
+            text_embedding: TextEmbedding::new(config.number_text_tokens + 1, config.n_embd),
+            text_embedding_weight: None,
+            text_position: LearnedPositionEmbedding::new(config.max_text_tokens + 2, config.n_embd),
+            text_position_weight: None,
+            language_embedding: TextEmbedding::new(107, config.n_embd),
+            language_embedding_weight: None,
             mel_embedding: TextEmbedding::new(config.n_vocab, config.n_embd),
             mel_position: LearnedPositionEmbedding::new(mel_positions, config.n_embd),
             config,
@@ -78,6 +90,9 @@ impl IndexGpt {
                 .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {name}")))
         };
 
+        self.text_embedding_weight = Some(get("text_embedding.weight")?);
+        self.text_position_weight = Some(get("text_pos_embedding.emb.weight")?);
+        self.language_embedding_weight = Some(get("lang_embedding.weight")?);
         self.mel_embedding_weight = Some(get("mel_embedding.weight")?);
         self.mel_position_weight = Some(get("mel_pos_embedding.emb.weight")?);
 
@@ -120,6 +135,49 @@ impl IndexGpt {
         ));
         self.loaded = true;
         Ok(())
+    }
+
+    /// Construct `[conditioning; start_text; text; stop_text]` embeddings.
+    pub fn build_prefix(
+        &self,
+        conditioning: &Tensor,
+        text_tokens: &[u32],
+        language_id: u32,
+    ) -> CandleResult<Tensor> {
+        self.require_loaded()?;
+        let (batch, _, hidden) = conditioning.dims3()?;
+        if batch != 1 || hidden != self.config.n_embd {
+            candle_core::bail!("conditioning shape {:?}, expected [1, N, {}]", conditioning.dims(), self.config.n_embd)
+        }
+        let filtered: Vec<u32> = text_tokens.iter().copied()
+            .filter(|token| *token != self.config.start_text_token && *token != self.config.stop_text_token)
+            .collect();
+        if filtered.len() > self.config.max_text_tokens {
+            candle_core::bail!("text has {} tokens, maximum is {}", filtered.len(), self.config.max_text_tokens)
+        }
+        let mut ids = Vec::with_capacity(filtered.len() + 2);
+        ids.push(self.config.start_text_token);
+        ids.extend(filtered);
+        ids.push(self.config.stop_text_token);
+        let ids = Tensor::new(ids.as_slice(), &self.device)?.reshape((1, ids.len()))?;
+        let positions: Vec<u32> = (0..ids.dim(1)? as u32).collect();
+        let positions = Tensor::new(positions.as_slice(), &self.device)?;
+        let token_embeddings = self.text_embedding.forward(
+            &ids,
+            self.text_embedding_weight.as_ref().unwrap(),
+        )?;
+        let position_embeddings = self.text_position.forward(
+            &positions,
+            self.text_position_weight.as_ref().unwrap(),
+        )?;
+        let language = Tensor::new(&[language_id], &self.device)?;
+        let language_embedding = self.language_embedding.forward(
+            &language,
+            self.language_embedding_weight.as_ref().unwrap(),
+        )?.reshape((1, 1, self.config.n_embd))?;
+        let text = token_embeddings.broadcast_add(&position_embeddings)?
+            .broadcast_add(&language_embedding)?;
+        Tensor::cat(&[conditioning, &text], 1)
     }
 
     pub fn store_mel_emb(&mut self, prefix: Tensor) {
@@ -280,6 +338,8 @@ mod tests {
             n_positions: 8,
             n_ctx: 8,
             n_inner: 4,
+            number_text_tokens: 5,
+            max_text_tokens: 4,
             max_mel_tokens: 5,
             num_mel_codes: 3,
             start_mel_token: 1,
@@ -293,6 +353,9 @@ mod tests {
         let z2 = |shape| Tensor::zeros(shape, DType::F32, device).unwrap();
         let o1 = |size| Tensor::ones(size, DType::F32, device).unwrap();
         HashMap::from([
+            ("text_embedding.weight".into(), z2((6, 2))),
+            ("text_pos_embedding.emb.weight".into(), z2((6, 2))),
+            ("lang_embedding.weight".into(), z2((107, 2))),
             ("mel_embedding.weight".into(), z2((3, 2))),
             ("mel_pos_embedding.emb.weight".into(), z2((8, 2))),
             ("gpt.h.0.ln_1.weight".into(), o1(2)),
@@ -321,19 +384,21 @@ mod tests {
         let device = Device::Cpu;
         let mut model = IndexGpt::new(tiny_config(), device.clone()).unwrap();
         model.load_state_dict(&tiny_weights(&device)).unwrap();
-        let prefix = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
+        let conditioning = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
+        let prefix = model.build_prefix(&conditioning, &[2, 3], 1).unwrap();
+        assert_eq!(prefix.dims(), &[1, 5, 2]);
         let text = Tensor::new(&[[0u32]], &device).unwrap();
         let (input_ids, mask) = model.prepare_inputs(&prefix, &text, None).unwrap();
         let mut cache = KvCache::new(8, device.clone());
         let logits = model.prefill(&input_ids, Some(&mask), None, Some(&mut cache)).unwrap();
-        assert_eq!(logits.dims(), &[1, 2, 3]);
-        assert_eq!(cache.seq_len(), 2);
+        assert_eq!(logits.dims(), &[1, 6, 3]);
+        assert_eq!(cache.seq_len(), 6);
         assert_eq!(logits.to_vec3::<f32>().unwrap()[0][1], vec![1., 2., 3.]);
 
         let next = Tensor::new(&[[1u32]], &device).unwrap();
         let logits = model.decode(&next, &mut cache, 2).unwrap();
         assert_eq!(logits.dims(), &[1, 1, 3]);
-        assert_eq!(cache.seq_len(), 3);
+        assert_eq!(cache.seq_len(), 7);
     }
 
     #[test]

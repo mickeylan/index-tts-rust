@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Export the official IndexTTS-2.5 greedy GPT weights to safetensors.
 
-The exported package intentionally accepts precomputed prefix embeddings. It
-therefore contains only the semantic GPT, mel embeddings/positions, final
-normalization, and mel head. PyTorch Conv1D tensors retain their native
+The exported package contains the semantic GPT plus text/language/mel
+embeddings needed to construct the complete inference prefix. PyTorch Conv1D tensors retain their native
 [input, output] layout; the Rust loader is responsible for that contract.
 """
 
@@ -27,6 +26,9 @@ def required_specs() -> dict[str, tuple[int, ...]]:
     specs: dict[str, tuple[int, ...]] = {
         "mel_embedding.weight": (MEL_CODES, HIDDEN),
         "mel_pos_embedding.emb.weight": (1818, HIDDEN),
+        "text_embedding.weight": (60510, HIDDEN),
+        "text_pos_embedding.emb.weight": (602, HIDDEN),
+        "lang_embedding.weight": (107, HIDDEN),
     }
     for layer in range(LAYERS):
         prefix = f"gpt.h.{layer}"

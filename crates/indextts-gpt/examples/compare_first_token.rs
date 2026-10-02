@@ -9,7 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cpu;
 
     let fixture = candle_core::safetensors::load(&fixture_path, &device)?;
-    let prefix = fixture.get("prefix").ok_or("fixture missing prefix")?.clone();
+    let expected_prefix = fixture.get("prefix").ok_or("fixture missing prefix")?.clone();
+    let conditioning = fixture.get("conditioning").ok_or("fixture missing conditioning")?;
+    let text_tokens = fixture.get("text_tokens").ok_or("fixture missing text_tokens")?;
+    let language = fixture.get("language").ok_or("fixture missing language")?;
     let fake_ids = fixture.get("fake_ids").ok_or("fixture missing fake_ids")?.clone();
     let expected_logits = fixture.get("first_logits").ok_or("fixture missing first_logits")?;
     let metadata: serde_json::Value = serde_json::from_str(
@@ -23,6 +26,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut model = IndexGpt::new(GptConfig::default(), device.clone())?;
     model.load_weights(&weights_path)?;
+    let conditioning = conditioning.to_dtype(candle_core::DType::F32)?;
+    let text_tokens: Vec<u32> = text_tokens.flatten_all()?.to_vec1::<i64>()?
+        .into_iter().map(|token| token as u32).collect();
+    let language = language.flatten_all()?.to_vec1::<i64>()?[0] as u32;
+    let prefix = model.build_prefix(&conditioning, &text_tokens, language)?;
+    let prefix_error = prefix.sub(&expected_prefix.to_dtype(candle_core::DType::F32)?)?
+        .abs()?.max_all()?.to_scalar::<f32>()?;
+    println!("prefix_max_abs_error={prefix_error}");
+    if prefix_error > 1e-5 {
+        return Err("text prefix embedding mismatch".into());
+    }
     model.store_mel_emb(prefix);
     let mut cache = KvCache::new(model.config().n_positions, device);
     let logits = model.prefill(&fake_ids, None, None, Some(&mut cache))?;

@@ -8,7 +8,10 @@ from export_weights import required_specs, select_and_validate
 class ExportWeightsTests(unittest.TestCase):
     def test_contract_has_exact_greedy_tensor_count(self):
         specs = required_specs()
-        self.assertEqual(len(specs), 296)
+        self.assertEqual(len(specs), 299)
+        self.assertEqual(specs["text_embedding.weight"], (60510, 1280))
+        self.assertEqual(specs["text_pos_embedding.emb.weight"], (602, 1280))
+        self.assertEqual(specs["lang_embedding.weight"], (107, 1280))
         self.assertEqual(specs["gpt.h.0.attn.c_attn.weight"], (1280, 3840))
         self.assertNotIn("wte.weight", specs)
         self.assertNotIn("wpe.weight", specs)

@@ -76,6 +76,9 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     save_file(
         {
+            "conditioning": conditioning.float().contiguous(),
+            "text_tokens": text_tokens.contiguous(),
+            "language": language.contiguous(),
             "prefix": prefix.float().contiguous(),
             "fake_ids": fake_ids.contiguous(),
             "attention_mask": attention_mask.contiguous(),

@@ -157,12 +157,15 @@ pub struct WeightSpec {
     pub conv1d_input_major: bool,
 }
 
-/// Exact tensors required when prefix conditioning/text embeddings are
-/// supplied by the caller and Rust only performs semantic-token generation.
+/// Exact tensors required to construct text/language prefixes and perform
+/// semantic-token generation.
 pub fn greedy_gpt_weight_specs() -> Vec<WeightSpec> {
     let mut specs = vec![
         WeightSpec { name: "mel_embedding.weight".into(), shape: vec![8194, 1280], conv1d_input_major: false },
         WeightSpec { name: "mel_pos_embedding.emb.weight".into(), shape: vec![1818, 1280], conv1d_input_major: false },
+        WeightSpec { name: "text_embedding.weight".into(), shape: vec![60510, 1280], conv1d_input_major: false },
+        WeightSpec { name: "text_pos_embedding.emb.weight".into(), shape: vec![602, 1280], conv1d_input_major: false },
+        WeightSpec { name: "lang_embedding.weight".into(), shape: vec![107, 1280], conv1d_input_major: false },
     ];
 
     for layer in 0..24 {
@@ -212,7 +215,7 @@ mod tests {
     #[test]
     fn greedy_contract_matches_official_architecture() {
         let specs = greedy_gpt_weight_specs();
-        assert_eq!(specs.len(), 296);
+        assert_eq!(specs.len(), 299);
         assert_eq!(specs[0].name, "mel_embedding.weight");
         assert_eq!(specs[0].shape, vec![8194, 1280]);
 
