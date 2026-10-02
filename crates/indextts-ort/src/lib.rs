@@ -293,6 +293,19 @@ pub fn run_gpt_conditioning(
     })
 }
 
+pub fn run_semantic_codec(session: &OnnxSession, codes: &[u32]) -> Result<Tensor> {
+    if codes.is_empty() {
+        return Err(IndexTtsError::EmptySemanticCodes);
+    }
+    let codes: Vec<i64> = codes.iter().map(|code| *code as i64).collect();
+    session.run_tensors(
+        vec![("codes", Tensor::new_i64(codes.clone(), vec![1, codes.len() as i64]))],
+        vec!["semantic_features".into()],
+    )?.into_iter().next().ok_or_else(|| {
+        IndexTtsError::BackendFailure("missing semantic codec output".into())
+    })
+}
+
 pub fn run_bigvgan(session: &OnnxSession, mel: Tensor) -> Result<Tensor> {
     session.run_tensors(vec![("mel", mel)], vec!["audio".into()])?
         .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing BigVGAN output".into()))

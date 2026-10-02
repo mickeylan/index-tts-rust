@@ -256,9 +256,82 @@ def export_gpt_conditioning(source: Path, model_dir: Path, output: Path) -> None
         raise RuntimeError(f"GPT conditioning dynamic-shape parity failed: {dynamic_error}")
 
 
+def export_semantic_codec(source: Path, model_dir: Path, output: Path) -> None:
+    sys.path.insert(0, str(source.resolve()))
+    from omegaconf import OmegaConf
+    from torch import nn
+    from indextts.codec.models import EnhancedCodec
+
+    config = OmegaConf.load(model_dir / "config.yaml")
+    codec = EnhancedCodec(**config.semantic_codec, cfg=config.semantic_codec)
+    codec.load_checkpoint(str(model_dir / "codec.pth"))
+    codec.eval()
+
+    class Decoder(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, codes):
+            return self.model.decode(codes)
+
+    wrapper = Decoder(codec).eval()
+    torch.manual_seed(1234)
+    codes = torch.randint(0, config.semantic_codec.codebook_size, (1, 17), dtype=torch.long)
+    with torch.no_grad():
+        expected = wrapper(codes).cpu().numpy()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (codes,),
+        str(output),
+        input_names=["codes"],
+        output_names=["semantic_features"],
+        dynamic_axes={
+            "codes": {0: "batch", 1: "codes"},
+            "semantic_features": {0: "batch", 1: "frames"},
+        },
+        opset_version=17,
+        dynamo=False,
+    )
+
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    actual = session.run(["semantic_features"], {"codes": codes.numpy()})[0]
+    difference = np.abs(expected - actual)
+    max_error = float(np.max(difference))
+    mean_error = float(np.mean(difference))
+    print(
+        f"semantic_codec output_shape={list(actual.shape)} "
+        f"max_abs_error={max_error:.9g} mean_abs_error={mean_error:.9g}"
+    )
+    if max_error > 0.003 or mean_error > 2e-5:
+        raise RuntimeError(
+            f"semantic codec ONNX parity failed: max={max_error}, mean={mean_error}"
+        )
+
+    dynamic_codes = torch.randint(0, config.semantic_codec.codebook_size, (1, 23), dtype=torch.long)
+    with torch.no_grad():
+        dynamic_expected = wrapper(dynamic_codes).cpu().numpy()
+    dynamic_actual = session.run(
+        ["semantic_features"], {"codes": dynamic_codes.numpy()}
+    )[0]
+    dynamic_error = float(np.max(np.abs(dynamic_expected - dynamic_actual)))
+    print(
+        f"semantic_codec dynamic_codes=23 output_shape={list(dynamic_actual.shape)} "
+        f"max_abs_error={dynamic_error:.9g}"
+    )
+    if dynamic_error > 0.003:
+        raise RuntimeError(f"semantic codec dynamic parity failed: {dynamic_error}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("component", choices=["campplus", "wav2vec2bert", "gpt-conditioning"]) 
+    parser.add_argument(
+        "component",
+        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec"],
+    )
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -270,6 +343,8 @@ def main() -> None:
         export_wav2vec2bert(args.model_dir, args.output)
     elif args.component == "gpt-conditioning":
         export_gpt_conditioning(args.source, args.model_dir, args.output)
+    elif args.component == "semantic-codec":
+        export_semantic_codec(args.source, args.model_dir, args.output)
 
 
 if __name__ == "__main__":
