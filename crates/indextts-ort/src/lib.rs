@@ -328,6 +328,50 @@ pub fn run_length_regulator(
     })
 }
 
+/// Fixed-length DiT session selected from exported frame buckets.
+#[derive(Debug, Clone)]
+pub struct DitBucket {
+    pub frames: usize,
+    pub session: OnnxSession,
+}
+
+#[derive(Debug, Clone)]
+pub struct DitBuckets {
+    buckets: Vec<DitBucket>,
+}
+
+impl DitBuckets {
+    pub fn load(model_dir: &Path, frame_sizes: &[usize]) -> Result<Self> {
+        let mut buckets = Vec::new();
+        for &frames in frame_sizes {
+            let path = model_dir.join("onnx").join("s2mel").join(format!("model-{frames}.onnx"));
+            if path.is_file() {
+                buckets.push(DitBucket { frames, session: OnnxSession::load(&path)? });
+            }
+        }
+        buckets.sort_by_key(|bucket| bucket.frames);
+        if buckets.is_empty() {
+            return Err(IndexTtsError::InvalidModel(format!(
+                "no DiT frame buckets found under {}", model_dir.join("onnx/s2mel").display()
+            )));
+        }
+        Ok(Self { buckets })
+    }
+
+    pub fn select(&self, required_frames: usize) -> Result<&DitBucket> {
+        self.buckets.iter().find(|bucket| bucket.frames >= required_frames).ok_or_else(|| {
+            IndexTtsError::BackendFailure(format!(
+                "no DiT bucket can fit {required_frames} frames; largest is {}",
+                self.buckets.last().map(|bucket| bucket.frames).unwrap_or(0)
+            ))
+        })
+    }
+
+    pub fn frame_sizes(&self) -> Vec<usize> {
+        self.buckets.iter().map(|bucket| bucket.frames).collect()
+    }
+}
+
 pub fn run_dit(
     session: &OnnxSession,
     x: Tensor,
@@ -349,6 +393,62 @@ pub fn run_dit(
 }
 
 /// Run the official 25-step Euler CFM solver with classifier-free guidance.
+pub fn solve_cfm_bucketed(
+    buckets: &DitBuckets,
+    condition: &Tensor,
+    prompt_mel: &Tensor,
+    style: &Tensor,
+    steps: usize,
+    cfg_rate: f32,
+    seed: u64,
+) -> Result<Tensor> {
+    let required_frames = *condition.shape().get(1).ok_or_else(|| {
+        IndexTtsError::BackendFailure("CFM condition has no time dimension".into())
+    })? as usize;
+    let bucket = buckets.select(required_frames)?;
+    let padded_condition = pad_condition(condition, bucket.frames)?;
+    let output = solve_cfm(
+        &bucket.session, &padded_condition, prompt_mel, style, steps, cfg_rate, seed,
+    )?;
+    crop_mel_frames(&output, required_frames)
+}
+
+fn pad_condition(condition: &Tensor, frames: usize) -> Result<Tensor> {
+    let Tensor::F32 { data, shape } = condition else {
+        return Err(IndexTtsError::BackendFailure("DiT condition must be f32".into()));
+    };
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != 512 || shape[1] as usize > frames {
+        return Err(IndexTtsError::BackendFailure(format!(
+            "cannot pad condition {shape:?} to {frames} frames"
+        )));
+    }
+    let source_frames = shape[1] as usize;
+    let mut padded = vec![0f32; frames * 512];
+    for frame in 0..source_frames {
+        padded[frame * 512..(frame + 1) * 512]
+            .copy_from_slice(&data[frame * 512..(frame + 1) * 512]);
+    }
+    Ok(Tensor::new(padded, vec![1, frames as i64, 512]))
+}
+
+fn crop_mel_frames(mel: &Tensor, frames: usize) -> Result<Tensor> {
+    let Tensor::F32 { data, shape } = mel else {
+        return Err(IndexTtsError::BackendFailure("DiT output must be f32".into()));
+    };
+    if shape.len() != 3 || shape[0] != 1 || shape[1] != 80 || frames > shape[2] as usize {
+        return Err(IndexTtsError::BackendFailure(format!(
+            "cannot crop DiT output {shape:?} to {frames} frames"
+        )));
+    }
+    let bucket_frames = shape[2] as usize;
+    let mut cropped = Vec::with_capacity(80 * frames);
+    for channel in 0..80 {
+        let offset = channel * bucket_frames;
+        cropped.extend_from_slice(&data[offset..offset + frames]);
+    }
+    Ok(Tensor::new(cropped, vec![1, 80, frames as i64]))
+}
+
 pub fn solve_cfm(
     session: &OnnxSession,
     condition: &Tensor,
@@ -457,5 +557,22 @@ mod tests {
     fn rejects_invalid_tensor_shape() {
         let tensor = Tensor::new_i64(vec![1, 2], vec![1, 3]);
         assert!(tensor.validate().is_err());
+    }
+
+    #[test]
+    fn condition_padding_and_mel_cropping_preserve_layout() {
+        let condition = Tensor::new(
+            (0..3 * 512).map(|value| value as f32).collect(),
+            vec![1, 3, 512],
+        );
+        let padded = pad_condition(&condition, 5).unwrap();
+        assert_eq!(padded.shape(), &[1, 5, 512]);
+        assert_eq!(&padded.as_slice()[..3 * 512], condition.as_slice());
+        assert!(padded.as_slice()[3 * 512..].iter().all(|value| *value == 0.0));
+
+        let mel = Tensor::new((0..80 * 5).map(|value| value as f32).collect(), vec![1, 80, 5]);
+        let cropped = crop_mel_frames(&mel, 3).unwrap();
+        assert_eq!(cropped.shape(), &[1, 80, 3]);
+        assert_eq!(&cropped.as_slice()[..6], &[0., 1., 2., 5., 6., 7.]);
     }
 }
