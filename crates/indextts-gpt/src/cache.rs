@@ -48,12 +48,23 @@ impl KvCache {
     }
 
     /// Update cache with new key-value pairs
-    pub fn update(&mut self, layer: usize, new_key: &Tensor, new_value: &Tensor) -> CandleResult<(Tensor, Tensor)> {
-        if !new_key.device().same_device(&self.device) || !new_value.device().same_device(&self.device) {
+    pub fn update(
+        &mut self,
+        layer: usize,
+        new_key: &Tensor,
+        new_value: &Tensor,
+    ) -> CandleResult<(Tensor, Tensor)> {
+        if !new_key.device().same_device(&self.device)
+            || !new_value.device().same_device(&self.device)
+        {
             candle_core::bail!("KV cache tensors must be on the cache device")
         }
         if new_key.dims() != new_value.dims() {
-            candle_core::bail!("KV key/value shapes differ: {:?} vs {:?}", new_key.dims(), new_value.dims())
+            candle_core::bail!(
+                "KV key/value shapes differ: {:?} vs {:?}",
+                new_key.dims(),
+                new_value.dims()
+            )
         }
         let new_len = new_key.dim(2)?;
         if self.seq_len() + new_len > self.max_seq_len {
@@ -65,11 +76,10 @@ impl KvCache {
         }
         let key_name = format!("layer_{}", layer);
         let value_name = format!("layer_{}", layer);
-        
-        if let (Some(existing_key), Some(existing_value)) = (
-            self.keys.get(&key_name),
-            self.values.get(&value_name)
-        ) {
+
+        if let (Some(existing_key), Some(existing_value)) =
+            (self.keys.get(&key_name), self.values.get(&value_name))
+        {
             let key = candle_core::Tensor::cat(&[existing_key, new_key], 2)?;
             let value = candle_core::Tensor::cat(&[existing_value, new_value], 2)?;
             self.keys.insert(key_name, key.clone());
@@ -86,20 +96,20 @@ impl KvCache {
     pub fn all_keys(&self) -> Option<Tensor> {
         let mut layers: Vec<_> = self.keys.keys().collect();
         layers.sort();
-        
+
         if layers.is_empty() {
             return None;
         }
-        
+
         let tensors: Vec<Tensor> = layers
             .iter()
             .filter_map(|k| self.keys.get(*k).cloned())
             .collect();
-        
+
         if tensors.is_empty() {
             return None;
         }
-        
+
         // Stack along a new dimension
         candle_core::Tensor::stack(&tensors, 0).ok()
     }
@@ -108,20 +118,20 @@ impl KvCache {
     pub fn all_values(&self) -> Option<Tensor> {
         let mut layers: Vec<_> = self.values.keys().collect();
         layers.sort();
-        
+
         if layers.is_empty() {
             return None;
         }
-        
+
         let tensors: Vec<Tensor> = layers
             .iter()
             .filter_map(|v| self.values.get(*v).cloned())
             .collect();
-        
+
         if tensors.is_empty() {
             return None;
         }
-        
+
         candle_core::Tensor::stack(&tensors, 0).ok()
     }
 
@@ -138,7 +148,9 @@ impl KvCache {
 
     /// Get cache length (current sequence length)
     pub fn seq_len(&self) -> usize {
-        self.keys.values().next()
+        self.keys
+            .values()
+            .next()
             .and_then(|t| t.dims().get(2).copied())
             .unwrap_or(0)
     }
@@ -155,7 +167,7 @@ pub fn create_causal_mask(seq_len: usize, device: &Device) -> CandleResult<Tenso
     let mask: Vec<f32> = (0..seq_len)
         .flat_map(|i| (0..seq_len).map(move |j| if j <= i { 0.0 } else { f32::MIN }))
         .collect();
-    
+
     Tensor::from_slice(&mask, (seq_len, seq_len), device)
 }
 
@@ -166,10 +178,8 @@ pub fn create_batch_attention_mask(
     device: &Device,
 ) -> CandleResult<Tensor> {
     // Create attention mask where valid positions are 1, padded positions are 0
-    let mask: Vec<f32> = std::iter::repeat(1.0_f32)
-        .take(batch_size * seq_len)
-        .collect();
-    
+    let mask: Vec<f32> = std::iter::repeat_n(1.0_f32, batch_size * seq_len).collect();
+
     Tensor::from_slice(&mask, (batch_size, seq_len), device)
 }
 

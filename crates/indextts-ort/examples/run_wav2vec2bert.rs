@@ -3,8 +3,12 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1).map(PathBuf::from);
-    let model = args.next().ok_or("usage: run_wav2vec2bert <model.onnx> <stats.safetensors>")?;
-    let stats = args.next().ok_or("usage: run_wav2vec2bert <model.onnx> <stats.safetensors>")?;
+    let model = args
+        .next()
+        .ok_or("usage: run_wav2vec2bert <model.onnx> <stats.safetensors>")?;
+    let stats = args
+        .next()
+        .ok_or("usage: run_wav2vec2bert <model.onnx> <stats.safetensors>")?;
     let session = OnnxSession::load(&model)?;
     let frames = 64usize;
     let features: Vec<f32> = (0..frames * 160)

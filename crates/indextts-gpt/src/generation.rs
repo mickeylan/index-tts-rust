@@ -21,8 +21,8 @@ use candle_core::{Device, IndexOp, Result as CandleResult, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use super::model::IndexGpt;
 use super::cache::KvCache;
+use super::model::IndexGpt;
 
 /// Generation result
 #[derive(Debug, Clone)]
@@ -102,42 +102,46 @@ impl Generator for GreedyGenerator {
         let config = model.config();
         let device = model.device();
         let stop_token = config.stop_mel_token;
-        
+
         // Initial prefill
         let mut logits = model.prefill(input_ids, attention_mask, None, self.kv_cache.as_mut())?;
-        
+
         let mut tokens = Vec::new();
         let seq_len = input_ids.dim(1)?;
         let mut current_pos = seq_len;
-        
+
         loop {
             // Get logits for last position
             let last_logits = logits.i((0, logits.dim(1)? - 1))?;
             let probs_vec = last_logits.to_vec1::<f32>()?;
-            
+
             let next_token = probs_vec
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
-            
+
             tokens.push(next_token);
-            
+
             // Check for stop token
             if next_token == stop_token {
                 // Remove stop token from output
                 tokens.pop();
                 let result_tokens = tokens.clone();
-                return Ok(GenerationOutput::new(result_tokens, true, Some(tokens.len())));
+                return Ok(GenerationOutput::new(
+                    result_tokens,
+                    true,
+                    Some(tokens.len()),
+                ));
             }
-            
+
             // Check max length
             if current_pos >= max_length {
                 let result_tokens = tokens.clone();
                 return Ok(GenerationOutput::new(result_tokens, false, None));
             }
-            
+
             // Decode next token
             let next_input = Tensor::new(&[next_token as i64], device)?.reshape((1, 1))?;
             logits = model.decode(&next_input, self.kv_cache.as_mut().unwrap(), current_pos)?;
@@ -212,7 +216,7 @@ impl SamplingGenerator {
     /// Sample a token from logits
     fn sample_token(&mut self, logits: &[f32]) -> u32 {
         let mut logits = logits.to_vec();
-        
+
         // Apply repetition penalty
         if self.repetition_penalty != 1.0 {
             for &token in &self.generated_tokens {
@@ -226,35 +230,39 @@ impl SamplingGenerator {
                 }
             }
         }
-        
+
         // Apply temperature
         if (self.temperature - 1.0).abs() > 1e-6 {
             for logit in &mut logits {
                 *logit /= self.temperature;
             }
         }
-        
+
         // Convert to probabilities
         let max_logit = logits.iter().cloned().fold(f32::MIN, f32::max);
         let exp_logits: Vec<f32> = logits.iter().map(|l| (l - max_logit).exp()).collect();
         let sum_exp: f32 = exp_logits.iter().sum();
         let mut probs: Vec<f32> = exp_logits.iter().map(|e| e / sum_exp).collect();
-        
+
         // Apply top-k
         if self.top_k > 0 && self.top_k < probs.len() {
             // Keep only top-k
             let mut indices: Vec<usize> = (0..probs.len()).collect();
-            indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+            indices.sort_by(|&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             indices.truncate(self.top_k);
-            
+
             let mask: Vec<f32> = (0..probs.len())
                 .map(|i| if indices.contains(&i) { 1.0 } else { 0.0 })
                 .collect();
-            
+
             for (i, m) in mask.iter().enumerate() {
                 probs[i] *= m;
             }
-            
+
             // Renormalize
             let sum: f32 = probs.iter().sum();
             if sum > 0.0 {
@@ -263,12 +271,16 @@ impl SamplingGenerator {
                 }
             }
         }
-        
+
         // Apply top-p (nucleus)
         if self.top_p < 1.0 && self.top_p > 0.0 {
             let mut indices: Vec<usize> = (0..probs.len()).collect();
-            indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
-            
+            indices.sort_by(|&a, &b| {
+                probs[b]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
             let mut cumsum = 0.0f32;
             let mut selected = Vec::new();
             for &idx in &indices {
@@ -278,16 +290,16 @@ impl SamplingGenerator {
                     break;
                 }
             }
-            
+
             // Zero out non-selected and renormalize
             let mask: Vec<f32> = (0..probs.len())
                 .map(|i| if selected.contains(&i) { 1.0 } else { 0.0 })
                 .collect();
-            
+
             for (i, m) in mask.iter().enumerate() {
                 probs[i] *= m;
             }
-            
+
             let sum: f32 = probs.iter().sum();
             if sum > 0.0 {
                 for p in &mut probs {
@@ -295,7 +307,7 @@ impl SamplingGenerator {
                 }
             }
         }
-        
+
         // Sample from distribution
         let r: f32 = self.rng.random();
         let mut cumsum = 0.0f32;
@@ -305,7 +317,7 @@ impl SamplingGenerator {
                 return i as u32;
             }
         }
-        
+
         // Fallback to highest probability
         probs
             .iter()
@@ -327,39 +339,43 @@ impl Generator for SamplingGenerator {
         let config = model.config();
         let device = model.device();
         let stop_token = config.stop_mel_token;
-        
+
         // Initial prefill
         let mut logits = model.prefill(input_ids, attention_mask, None, self.kv_cache.as_mut())?;
-        
+
         let mut tokens = Vec::new();
         let seq_len = input_ids.dim(1)?;
         let mut current_pos = seq_len;
         self.generated_tokens.clear();
-        
+
         loop {
             // Get logits for last position
             let last_logits = logits.i((0, logits.dim(1)? - 1))?;
             let logits_vec = last_logits.to_vec1::<f32>()?;
-            
+
             // Sample next token
             let next_token = self.sample_token(&logits_vec);
-            
+
             tokens.push(next_token);
             self.generated_tokens.push(next_token);
-            
+
             // Check for stop token
             if next_token == stop_token {
                 tokens.pop();
                 let result_tokens = tokens.clone();
-                return Ok(GenerationOutput::new(result_tokens, true, Some(tokens.len())));
+                return Ok(GenerationOutput::new(
+                    result_tokens,
+                    true,
+                    Some(tokens.len()),
+                ));
             }
-            
+
             // Check max length
             if current_pos >= max_length {
                 let result_tokens = tokens.clone();
                 return Ok(GenerationOutput::new(result_tokens, false, None));
             }
-            
+
             // Decode next token
             let next_input = Tensor::new(&[next_token as i64], device)?.reshape((1, 1))?;
             logits = model.decode(&next_input, self.kv_cache.as_mut().unwrap(), current_pos)?;
@@ -412,9 +428,11 @@ impl Generator for BeamGenerator {
         _max_length: usize,
     ) -> CandleResult<GenerationOutput> {
         if self.num_beams > 1 {
-            candle_core::bail!("Beam search not yet implemented. Use greedy (num_beams=1) or sampling instead.");
+            candle_core::bail!(
+                "Beam search not yet implemented. Use greedy (num_beams=1) or sampling instead."
+            );
         }
-        
+
         // Fall back to greedy for single beam
         let mut greedy = GreedyGenerator::new(&self.device, 512);
         greedy.generate(_model, _input_ids, _attention_mask, _max_length)
@@ -444,7 +462,7 @@ mod tests {
             .with_top_k(50)
             .with_top_p(0.9)
             .with_repetition_penalty(1.1);
-        
+
         assert!((gen.temperature - 0.8).abs() < 0.001);
         assert_eq!(gen.top_k, 50);
         assert!((gen.top_p - 0.9).abs() < 0.001);

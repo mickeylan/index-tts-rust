@@ -242,8 +242,7 @@ impl TextNormalizer {
         PERCENTAGE
             .replace_all(text, |caps: &regex::Captures| {
                 let m = caps.get(0).map_or("", |m| m.as_str());
-                if m.ends_with('%') {
-                    let num = &m[..m.len() - 1];
+                if let Some(num) = m.strip_suffix('%') {
                     format!("百分之{}", num)
                 } else {
                     m.to_string()

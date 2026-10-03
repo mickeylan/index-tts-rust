@@ -4,11 +4,17 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
-    let model_dir = args.next().map(PathBuf::from)
+    let model_dir = args
+        .next()
+        .map(PathBuf::from)
         .ok_or("usage: generate_mel <model-dir> <reference.wav> <text>")?;
-    let reference_path = args.next().map(PathBuf::from)
+    let reference_path = args
+        .next()
+        .map(PathBuf::from)
         .ok_or("usage: generate_mel <model-dir> <reference.wav> <text>")?;
-    let text = args.next().and_then(|value| value.into_string().ok())
+    let text = args
+        .next()
+        .and_then(|value| value.into_string().ok())
         .ok_or("usage: generate_mel <model-dir> <reference.wav> <text>")?;
 
     let reference = ReferenceEncoder::load(&model_dir)?.encode(&reference_path)?;
@@ -17,6 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mel = runtime.generate_mel(&codes, &reference, 1.0, 0)?;
     println!("semantic_codes={}", codes.len);
     println!("generated_mel_shape={:?}", mel.shape());
-    println!("generated_mel_finite={}", mel.as_slice().iter().all(|value| value.is_finite()));
+    println!(
+        "generated_mel_finite={}",
+        mel.as_slice().iter().all(|value| value.is_finite())
+    );
     Ok(())
 }

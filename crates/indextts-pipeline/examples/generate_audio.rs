@@ -5,13 +5,21 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
-    let model_dir = args.next().map(PathBuf::from)
+    let model_dir = args
+        .next()
+        .map(PathBuf::from)
         .ok_or("usage: generate_audio <model-dir> <reference.wav> <text> <output.wav>")?;
-    let reference_path = args.next().map(PathBuf::from)
+    let reference_path = args
+        .next()
+        .map(PathBuf::from)
         .ok_or("usage: generate_audio <model-dir> <reference.wav> <text> <output.wav>")?;
-    let text = args.next().and_then(|value| value.into_string().ok())
+    let text = args
+        .next()
+        .and_then(|value| value.into_string().ok())
         .ok_or("usage: generate_audio <model-dir> <reference.wav> <text> <output.wav>")?;
-    let output = args.next().map(PathBuf::from)
+    let output = args
+        .next()
+        .map(PathBuf::from)
         .ok_or("usage: generate_audio <model-dir> <reference.wav> <text> <output.wav>")?;
 
     let reference = ReferenceEncoder::load(&model_dir)?.encode(&reference_path)?;
@@ -22,7 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     save_wav(&output, &audio)?;
     println!("semantic_codes={}", codes.len);
     println!("mel_shape={:?}", mel.shape());
-    println!("audio_samples={} sample_rate={}", audio.samples.len(), audio.sample_rate);
+    println!(
+        "audio_samples={} sample_rate={}",
+        audio.samples.len(),
+        audio.sample_rate
+    );
     println!("wrote={}", output.display());
     Ok(())
 }

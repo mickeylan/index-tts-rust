@@ -292,9 +292,10 @@ mod tests {
 
     #[test]
     fn test_weight_structures() {
-        let weights = HashMap::new();
-        let _ = Weights { tensors: weights };
-        assert!(true);
+        let weights = Weights {
+            tensors: HashMap::new(),
+        };
+        assert!(weights.as_map().is_empty());
     }
 
     #[test]

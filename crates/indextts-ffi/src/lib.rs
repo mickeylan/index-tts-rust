@@ -1,6 +1,6 @@
 //! Stable C ABI for IndexTTS-2.5.
 
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
 use indextts_audio::process_reference_audio;
 use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};

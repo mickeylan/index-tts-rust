@@ -2,7 +2,9 @@ use indextts_ort::{run_dit, OnnxSession, Tensor};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = std::env::args_os().nth(1).map(PathBuf::from)
+    let model = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
         .ok_or("usage: run_dit <model.onnx>")?;
     let session = OnnxSession::load(&model)?;
     let frames = 64i64;
@@ -16,7 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Tensor::new(vec![0.03; 2 * frames as usize * 512], vec![2, frames, 512]),
     )?;
     println!("velocity_shape={:?}", output.shape());
-    if output.shape() != [2, 80, frames] || !output.as_slice().iter().all(|value| value.is_finite()) {
+    if output.shape() != [2, 80, frames] || !output.as_slice().iter().all(|value| value.is_finite())
+    {
         return Err("invalid DiT output".into());
     }
     Ok(())

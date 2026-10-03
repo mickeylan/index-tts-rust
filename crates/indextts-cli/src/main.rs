@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use indextts_core::{GenerationConfig, Language, ModelConfig, DeviceConfig, Precision};
 use indextts_audio::save_wav;
+use indextts_core::{DeviceConfig, GenerationConfig, Language, ModelConfig, Precision};
 use indextts_pipeline::{IndexTtsPipeline, SemanticRuntime};
 use std::path::PathBuf;
 use tracing::info;
@@ -140,6 +140,7 @@ fn setup_logging(_verbose: bool, _log_dir: Option<PathBuf>) {
     let _ = tracing_subscriber::fmt::try_init();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_synth(
     model: PathBuf,
     voice: PathBuf,
@@ -248,9 +249,18 @@ fn main() -> Result<()> {
             top_p,
         } => {
             cmd_synth(
-                model, voice, text, language, output,
-                seed, duration_factor, do_sample, num_beams,
-                temperature, top_k, top_p,
+                model,
+                voice,
+                text,
+                language,
+                output,
+                seed,
+                duration_factor,
+                do_sample,
+                num_beams,
+                temperature,
+                top_k,
+                top_p,
             )?;
         }
         Commands::Tokens {

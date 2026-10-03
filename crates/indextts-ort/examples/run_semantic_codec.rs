@@ -2,7 +2,9 @@ use indextts_ort::{run_semantic_codec, OnnxSession};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = std::env::args_os().nth(1).map(PathBuf::from)
+    let model = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
         .ok_or("usage: run_semantic_codec <model.onnx>")?;
     let session = OnnxSession::load(&model)?;
     let codes: Vec<u32> = (0..17).map(|index| (index * 431) % 8192).collect();

@@ -26,11 +26,12 @@ pub const WAV2VEC_SAMPLE_RATE: u32 = 16_000;
 
 /// Read audio file and return samples (WAV only for now)
 pub fn read_audio(path: &Path) -> Result<AudioBuffer> {
-    let extension = path.extension()
+    let extension = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    
+
     match extension.as_str() {
         "wav" => read_wav(path),
         _ => {
@@ -48,61 +49,64 @@ pub fn read_audio(path: &Path) -> Result<AudioBuffer> {
 fn read_wav(path: &Path) -> Result<AudioBuffer> {
     let reader = hound::WavReader::open(path)
         .map_err(|e| IndexTtsError::InvalidAudio(format!("Failed to open WAV: {}", e)))?;
-    
+
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
-    
+
     // Convert to mono f32 samples
     let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            match spec.bits_per_sample {
-                8 => {
-                    let samples: Vec<i8> = reader.into_samples::<i8>()
-                        .filter_map(|s| s.ok())
-                        .collect();
-                    samples.chunks(channels)
-                        .map(|chunk| {
-                            let sum: f32 = chunk.iter().map(|&s| s as f32 / 128.0).sum();
-                            sum / channels as f32
-                        })
-                        .collect()
-                }
-                16 => {
-                    let samples: Vec<i16> = reader.into_samples::<i16>()
-                        .filter_map(|s| s.ok())
-                        .collect();
-                    samples.chunks(channels)
-                        .map(|chunk| {
-                            let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
-                            sum / channels as f32
-                        })
-                        .collect()
-                }
-                32 => {
-                    let samples: Vec<i32> = reader.into_samples::<i32>()
-                        .filter_map(|s| s.ok())
-                        .collect();
-                    samples.chunks(channels)
-                        .map(|chunk| {
-                            let sum: f32 = chunk.iter().map(|&s| s as f32 / 2147483648.0).sum();
-                            sum / channels as f32
-                        })
-                        .collect()
-                }
-                _ => {
-                    return Err(IndexTtsError::InvalidAudio(format!(
-                        "Unsupported bit depth: {}",
-                        spec.bits_per_sample
-                    )));
-                }
+        hound::SampleFormat::Int => match spec.bits_per_sample {
+            8 => {
+                let samples: Vec<i8> = reader.into_samples::<i8>().filter_map(|s| s.ok()).collect();
+                samples
+                    .chunks(channels)
+                    .map(|chunk| {
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / 128.0).sum();
+                        sum / channels as f32
+                    })
+                    .collect()
             }
-        }
+            16 => {
+                let samples: Vec<i16> = reader
+                    .into_samples::<i16>()
+                    .filter_map(|s| s.ok())
+                    .collect();
+                samples
+                    .chunks(channels)
+                    .map(|chunk| {
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
+                        sum / channels as f32
+                    })
+                    .collect()
+            }
+            32 => {
+                let samples: Vec<i32> = reader
+                    .into_samples::<i32>()
+                    .filter_map(|s| s.ok())
+                    .collect();
+                samples
+                    .chunks(channels)
+                    .map(|chunk| {
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / 2147483648.0).sum();
+                        sum / channels as f32
+                    })
+                    .collect()
+            }
+            _ => {
+                return Err(IndexTtsError::InvalidAudio(format!(
+                    "Unsupported bit depth: {}",
+                    spec.bits_per_sample
+                )));
+            }
+        },
         hound::SampleFormat::Float => {
-            let samples: Vec<f32> = reader.into_samples::<f32>()
+            let samples: Vec<f32> = reader
+                .into_samples::<f32>()
                 .filter_map(|s| s.ok())
                 .collect();
-            samples.chunks(channels)
+            samples
+                .chunks(channels)
                 .map(|chunk| {
                     let sum: f32 = chunk.iter().sum();
                     sum / channels as f32
@@ -110,18 +114,18 @@ fn read_wav(path: &Path) -> Result<AudioBuffer> {
                 .collect()
         }
     };
-    
+
     if samples.is_empty() {
         return Err(IndexTtsError::InvalidAudio("No samples in WAV file".into()));
     }
-    
+
     Ok(AudioBuffer::new(samples, sample_rate))
 }
 
 /// Process reference audio for IndexTTS
 pub fn process_reference_audio(path: &Path) -> Result<(AudioBuffer, AudioBuffer)> {
     let mut audio = read_audio(path)?;
-    
+
     // Check minimum duration
     let min_samples = (MIN_REFERENCE_DURATION * audio.sample_rate as f64) as usize;
     if audio.samples.len() < min_samples {
@@ -131,18 +135,18 @@ pub fn process_reference_audio(path: &Path) -> Result<(AudioBuffer, AudioBuffer)
             MIN_REFERENCE_DURATION
         )));
     }
-    
+
     // Truncate to 15 seconds
     let max_samples = (MAX_REFERENCE_DURATION * audio.sample_rate as f64) as usize;
     if audio.samples.len() > max_samples {
         audio.samples.truncate(max_samples);
     }
-    
+
     // Clamp to [-1, 1]
     for sample in &mut audio.samples {
         *sample = sample.clamp(-1.0, 1.0);
     }
-    
+
     // Validate no NaN/Inf
     for (i, &sample) in audio.samples.iter().enumerate() {
         if !sample.is_finite() {
@@ -152,10 +156,9 @@ pub fn process_reference_audio(path: &Path) -> Result<(AudioBuffer, AudioBuffer)
             )));
         }
     }
-    
-    validate_audio(&audio).map_err(|error| {
-        IndexTtsError::InvalidReferenceAudio(error.to_string())
-    })?;
+
+    validate_audio(&audio)
+        .map_err(|error| IndexTtsError::InvalidReferenceAudio(error.to_string()))?;
 
     let audio_16000 = resample_mono(&audio, WAV2VEC_SAMPLE_RATE)?;
     let audio_22050 = resample_mono(&audio, INDEXTTS_SAMPLE_RATE)?;
@@ -173,29 +176,33 @@ pub fn resample_mono(audio: &AudioBuffer, target_rate: u32) -> Result<AudioBuffe
         ));
     }
 
-    let mut resampler = FftFixedInOut::<f32>::new(
-        audio.sample_rate as usize,
-        target_rate as usize,
-        1024,
-        1,
-    ).map_err(|error| IndexTtsError::InvalidAudio(format!("resampler setup failed: {error}")))?;
+    let mut resampler =
+        FftFixedInOut::<f32>::new(audio.sample_rate as usize, target_rate as usize, 1024, 1)
+            .map_err(|error| {
+                IndexTtsError::InvalidAudio(format!("resampler setup failed: {error}"))
+            })?;
     let delay = resampler.output_delay();
     let expected_len = ((audio.samples.len() as u64 * target_rate as u64
-        + audio.sample_rate as u64 / 2) / audio.sample_rate as u64) as usize;
+        + audio.sample_rate as u64 / 2)
+        / audio.sample_rate as u64) as usize;
     let mut remaining = audio.samples.as_slice();
     let mut output = Vec::with_capacity(expected_len + delay);
 
     while remaining.len() >= resampler.input_frames_next() {
         let input = [remaining];
-        let chunk = resampler.process(&input, None)
+        let chunk = resampler
+            .process(&input, None)
             .map_err(|error| IndexTtsError::InvalidAudio(format!("resampling failed: {error}")))?;
         remaining = &remaining[resampler.input_frames_next()..];
         output.extend_from_slice(&chunk[0]);
     }
     if !remaining.is_empty() {
         let input = [remaining];
-        let chunk = resampler.process_partial(Some(&input), None)
-            .map_err(|error| IndexTtsError::InvalidAudio(format!("resampling tail failed: {error}")))?;
+        let chunk = resampler
+            .process_partial(Some(&input), None)
+            .map_err(|error| {
+                IndexTtsError::InvalidAudio(format!("resampling tail failed: {error}"))
+            })?;
         output.extend_from_slice(&chunk[0]);
     }
 
@@ -217,7 +224,8 @@ pub struct SeamlessM4tFeatures {
 pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures> {
     if audio.sample_rate != WAV2VEC_SAMPLE_RATE {
         return Err(IndexTtsError::InvalidAudio(format!(
-            "SeamlessM4T requires 16000 Hz audio, got {}", audio.sample_rate
+            "SeamlessM4T requires 16000 Hz audio, got {}",
+            audio.sample_rate
         )));
     }
     const FRAME: usize = 400;
@@ -226,27 +234,36 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
     const BINS: usize = FFT / 2 + 1;
     const MELS: usize = 80;
     if audio.samples.len() < FRAME {
-        return Err(IndexTtsError::InvalidAudio("audio is too short for one feature frame".into()));
+        return Err(IndexTtsError::InvalidAudio(
+            "audio is too short for one feature frame".into(),
+        ));
     }
     let raw_frames = 1 + (audio.samples.len() - FRAME) / HOP;
     let frames = raw_frames - raw_frames % 2;
     if frames < 2 {
-        return Err(IndexTtsError::InvalidAudio("audio is too short after stride-2 stacking".into()));
+        return Err(IndexTtsError::InvalidAudio(
+            "audio is too short after stride-2 stacking".into(),
+        ));
     }
 
-    let window: Vec<f64> = (0..FRAME).map(|index| {
-        let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (FRAME - 1) as f64).cos();
-        hann.powf(0.85)
-    }).collect();
+    let window: Vec<f64> = (0..FRAME)
+        .map(|index| {
+            let hann =
+                0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (FRAME - 1) as f64).cos();
+            hann.powf(0.85)
+        })
+        .collect();
     let mel_min = 1127.0f64 * (1.0f64 + 20.0 / 700.0).ln();
     let mel_max = 1127.0f64 * (1.0f64 + 8000.0 / 700.0).ln();
     let mel_points: Vec<f64> = (0..MELS + 2)
         .map(|index| mel_min + (mel_max - mel_min) * index as f64 / (MELS + 1) as f64)
         .collect();
-    let fft_mels: Vec<f64> = (0..BINS).map(|index| {
-        let hz = WAV2VEC_SAMPLE_RATE as f64 / FFT as f64 * index as f64;
-        1127.0 * (1.0 + hz / 700.0).ln()
-    }).collect();
+    let fft_mels: Vec<f64> = (0..BINS)
+        .map(|index| {
+            let hz = WAV2VEC_SAMPLE_RATE as f64 / FFT as f64 * index as f64;
+            1127.0 * (1.0 + hz / 700.0).ln()
+        })
+        .collect();
 
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(FFT);
@@ -255,8 +272,11 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
     for frame_index in 0..frames {
         buffer.fill(Complex::new(0.0, 0.0));
         let offset = frame_index * HOP;
-        let mean = audio.samples[offset..offset + FRAME].iter()
-            .map(|value| *value as f64 * 32768.0).sum::<f64>() / FRAME as f64;
+        let mean = audio.samples[offset..offset + FRAME]
+            .iter()
+            .map(|value| *value as f64 * 32768.0)
+            .sum::<f64>()
+            / FRAME as f64;
         let mut previous = audio.samples[offset] as f64 * 32768.0 - mean;
         buffer[0].re = previous * (1.0 - 0.97) * window[0];
         for index in 1..FRAME {
@@ -276,7 +296,9 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
                     (frequency - left) / (center - left)
                 } else if frequency > center && frequency <= right {
                     (right - frequency) / (right - center)
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 energy += buffer[bin].norm_sqr() * weight;
             }
             mel_frames[frame_index * MELS + mel] = energy.max(f32::EPSILON as f64).ln() as f32;
@@ -285,12 +307,17 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
 
     // Normalize each mel channel using sample variance (ddof=1).
     for mel in 0..MELS {
-        let mean = (0..frames).map(|frame| mel_frames[frame * MELS + mel] as f64)
-            .sum::<f64>() / frames as f64;
-        let variance = (0..frames).map(|frame| {
-            let delta = mel_frames[frame * MELS + mel] as f64 - mean;
-            delta * delta
-        }).sum::<f64>() / (frames - 1) as f64;
+        let mean = (0..frames)
+            .map(|frame| mel_frames[frame * MELS + mel] as f64)
+            .sum::<f64>()
+            / frames as f64;
+        let variance = (0..frames)
+            .map(|frame| {
+                let delta = mel_frames[frame * MELS + mel] as f64 - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / (frames - 1) as f64;
         let scale = (variance + 1e-7).sqrt();
         for frame in 0..frames {
             mel_frames[frame * MELS + mel] =
@@ -322,7 +349,8 @@ pub fn seamless_m4t_features(audio: &AudioBuffer) -> Result<SeamlessM4tFeatures>
 pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
     if audio.sample_rate != INDEXTTS_SAMPLE_RATE {
         return Err(IndexTtsError::InvalidAudio(format!(
-            "reference mel requires 22050 Hz audio, got {}", audio.sample_rate
+            "reference mel requires 22050 Hz audio, got {}",
+            audio.sample_rate
         )));
     }
     const FFT: usize = 1024;
@@ -331,7 +359,9 @@ pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
     const MELS: usize = 80;
     const PAD: usize = (FFT - HOP) / 2;
     if audio.samples.len() <= PAD {
-        return Err(IndexTtsError::InvalidAudio("audio is too short for reference mel padding".into()));
+        return Err(IndexTtsError::InvalidAudio(
+            "audio is too short for reference mel padding".into(),
+        ));
     }
     let mut padded = Vec::with_capacity(audio.samples.len() + 2 * PAD);
     padded.extend((1..=PAD).rev().map(|index| audio.samples[index]));
@@ -340,12 +370,18 @@ pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
     let frames = 1 + (padded.len() - FFT) / HOP;
 
     fn hz_to_slaney_mel(hz: f64) -> f64 {
-        if hz < 1000.0 { hz / (200.0 / 3.0) }
-        else { 15.0 + (hz / 1000.0).ln() / ((6.4f64).ln() / 27.0) }
+        if hz < 1000.0 {
+            hz / (200.0 / 3.0)
+        } else {
+            15.0 + (hz / 1000.0).ln() / ((6.4f64).ln() / 27.0)
+        }
     }
     fn slaney_mel_to_hz(mel: f64) -> f64 {
-        if mel < 15.0 { mel * (200.0 / 3.0) }
-        else { 1000.0 * (((6.4f64).ln() / 27.0) * (mel - 15.0)).exp() }
+        if mel < 15.0 {
+            mel * (200.0 / 3.0)
+        } else {
+            1000.0 * (((6.4f64).ln() / 27.0) * (mel - 15.0)).exp()
+        }
     }
     let mel_max = hz_to_slaney_mel(INDEXTTS_SAMPLE_RATE as f64 / 2.0);
     let frequencies: Vec<f64> = (0..MELS + 2)
@@ -354,9 +390,9 @@ pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
     let fft_hz: Vec<f64> = (0..BINS)
         .map(|index| INDEXTTS_SAMPLE_RATE as f64 / FFT as f64 * index as f64)
         .collect();
-    let window: Vec<f64> = (0..FFT).map(|index| {
-        0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / FFT as f64).cos()
-    }).collect();
+    let window: Vec<f64> = (0..FFT)
+        .map(|index| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / FFT as f64).cos())
+        .collect();
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(FFT);
     let mut buffer = vec![Complex::new(0.0, 0.0); FFT];
@@ -376,7 +412,9 @@ pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
             for bin in 0..BINS {
                 let hz = fft_hz[bin];
                 let weight = ((hz - left) / (center - left))
-                    .min((right - hz) / (right - center)).max(0.0) * area_norm;
+                    .min((right - hz) / (right - center))
+                    .max(0.0)
+                    * area_norm;
                 magnitude += (buffer[bin].norm_sqr() + 1e-9).sqrt() * weight;
             }
             output[mel * frames + frame] = magnitude.max(1e-5).ln() as f32;
@@ -389,7 +427,8 @@ pub fn reference_mel(audio: &AudioBuffer) -> Result<Vec<f32>> {
 pub fn campplus_fbank(audio: &AudioBuffer) -> Result<Vec<f32>> {
     if audio.sample_rate != WAV2VEC_SAMPLE_RATE {
         return Err(IndexTtsError::InvalidAudio(format!(
-            "CAMPPlus requires 16000 Hz audio, got {}", audio.sample_rate
+            "CAMPPlus requires 16000 Hz audio, got {}",
+            audio.sample_rate
         )));
     }
     const FRAME: usize = 400;
@@ -398,22 +437,29 @@ pub fn campplus_fbank(audio: &AudioBuffer) -> Result<Vec<f32>> {
     const BINS: usize = FFT / 2;
     const MELS: usize = 80;
     if audio.samples.len() < FRAME {
-        return Err(IndexTtsError::InvalidAudio("audio is too short for CAMPPlus fbank".into()));
+        return Err(IndexTtsError::InvalidAudio(
+            "audio is too short for CAMPPlus fbank".into(),
+        ));
     }
     let frames = 1 + (audio.samples.len() - FRAME) / HOP;
-    let window: Vec<f64> = (0..FRAME).map(|index| {
-        let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (FRAME - 1) as f64).cos();
-        hann.powf(0.85)
-    }).collect();
+    let window: Vec<f64> = (0..FRAME)
+        .map(|index| {
+            let hann =
+                0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (FRAME - 1) as f64).cos();
+            hann.powf(0.85)
+        })
+        .collect();
     let mel_min = 1127.0f64 * (1.0f64 + 20.0 / 700.0).ln();
     let mel_max = 1127.0f64 * (1.0f64 + 8000.0 / 700.0).ln();
     let mel_points: Vec<f64> = (0..MELS + 2)
         .map(|index| mel_min + (mel_max - mel_min) * index as f64 / (MELS + 1) as f64)
         .collect();
-    let fft_mels: Vec<f64> = (0..BINS).map(|index| {
-        let hz = WAV2VEC_SAMPLE_RATE as f64 / FFT as f64 * index as f64;
-        1127.0 * (1.0 + hz / 700.0).ln()
-    }).collect();
+    let fft_mels: Vec<f64> = (0..BINS)
+        .map(|index| {
+            let hz = WAV2VEC_SAMPLE_RATE as f64 / FFT as f64 * index as f64;
+            1127.0 * (1.0 + hz / 700.0).ln()
+        })
+        .collect();
 
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(FFT);
@@ -422,8 +468,11 @@ pub fn campplus_fbank(audio: &AudioBuffer) -> Result<Vec<f32>> {
     for frame_index in 0..frames {
         buffer.fill(Complex::new(0.0, 0.0));
         let offset = frame_index * HOP;
-        let mean = audio.samples[offset..offset + FRAME].iter()
-            .map(|value| *value as f64).sum::<f64>() / FRAME as f64;
+        let mean = audio.samples[offset..offset + FRAME]
+            .iter()
+            .map(|value| *value as f64)
+            .sum::<f64>()
+            / FRAME as f64;
         let mut previous = audio.samples[offset] as f64 - mean;
         buffer[0].re = previous * (1.0 - 0.97) * window[0];
         for index in 1..FRAME {
@@ -440,15 +489,18 @@ pub fn campplus_fbank(audio: &AudioBuffer) -> Result<Vec<f32>> {
             for bin in 0..BINS {
                 let frequency = fft_mels[bin];
                 let weight = ((frequency - left) / (center - left))
-                    .min((right - frequency) / (right - center)).max(0.0);
+                    .min((right - frequency) / (right - center))
+                    .max(0.0);
                 energy += buffer[bin].norm_sqr() * weight;
             }
             features[frame_index * MELS + mel] = energy.max(f32::EPSILON as f64).ln() as f32;
         }
     }
     for mel in 0..MELS {
-        let mean = (0..frames).map(|frame| features[frame * MELS + mel] as f64)
-            .sum::<f64>() / frames as f64;
+        let mean = (0..frames)
+            .map(|frame| features[frame * MELS + mel] as f64)
+            .sum::<f64>()
+            / frames as f64;
         for frame in 0..frames {
             features[frame * MELS + mel] -= mean as f32;
         }
@@ -461,11 +513,11 @@ pub fn validate_audio(audio: &AudioBuffer) -> Result<()> {
     if audio.samples.is_empty() {
         return Err(IndexTtsError::InvalidAudio("Empty audio".into()));
     }
-    
+
     if audio.sample_rate == 0 {
         return Err(IndexTtsError::InvalidAudio("Invalid sample rate".into()));
     }
-    
+
     // Check for NaN/Inf
     for (i, &sample) in audio.samples.iter().enumerate() {
         if !sample.is_finite() {
@@ -475,16 +527,20 @@ pub fn validate_audio(audio: &AudioBuffer) -> Result<()> {
             )));
         }
     }
-    
+
     // Check for silence
     let max_amplitude = audio.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     if max_amplitude < 0.001 {
-        return Err(IndexTtsError::InvalidAudio("Audio is silent or near-silent".into()));
+        return Err(IndexTtsError::InvalidAudio(
+            "Audio is silent or near-silent".into(),
+        ));
     }
-    
+
     // Check for clipping
     let clipping_threshold = 0.99;
-    let clipping_count = audio.samples.iter()
+    let clipping_count = audio
+        .samples
+        .iter()
         .filter(|&&s| s.abs() > clipping_threshold)
         .count();
     let clipping_ratio = clipping_count as f32 / audio.samples.len() as f32;
@@ -494,7 +550,7 @@ pub fn validate_audio(audio: &AudioBuffer) -> Result<()> {
             clipping_ratio * 100.0
         )));
     }
-    
+
     Ok(())
 }
 
@@ -506,32 +562,38 @@ pub fn save_wav(path: &Path, audio: &AudioBuffer) -> Result<()> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    
+
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| IndexTtsError::InvalidAudio(format!("Failed to create WAV writer: {}", e)))?;
-    
+
     for sample in &audio.samples {
         let sample_i16 = (*sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        writer.write_sample(sample_i16)
+        writer
+            .write_sample(sample_i16)
             .map_err(|e| IndexTtsError::InvalidAudio(format!("Failed to write sample: {}", e)))?;
     }
-    
-    writer.finalize()
+
+    writer
+        .finalize()
         .map_err(|e| IndexTtsError::InvalidAudio(format!("Failed to finalize WAV: {}", e)))?;
-    
+
     Ok(())
 }
 
 /// Convert AudioBuffer to Vec<i16> PCM
 pub fn to_pcm_i16(audio: &AudioBuffer) -> Vec<i16> {
-    audio.samples.iter()
+    audio
+        .samples
+        .iter()
         .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
         .collect()
 }
 
 /// Convert AudioBuffer to Vec<u8> 8-bit PCM
 pub fn to_pcm_u8(audio: &AudioBuffer) -> Vec<u8> {
-    audio.samples.iter()
+    audio
+        .samples
+        .iter()
         .map(|&s| ((s + 1.0) * 127.5).clamp(0.0, 255.0) as u8)
         .collect()
 }
@@ -552,14 +614,23 @@ mod tests {
     fn resampling_produces_exact_target_length_and_rate() {
         let source_rate = 48_000;
         let samples: Vec<f32> = (0..source_rate)
-            .map(|index| (2.0 * std::f32::consts::PI * 440.0 * index as f32 / source_rate as f32).sin() * 0.5)
+            .map(|index| {
+                (2.0 * std::f32::consts::PI * 440.0 * index as f32 / source_rate as f32).sin() * 0.5
+            })
             .collect();
         let source = AudioBuffer::new(samples, source_rate);
         let output = resample_mono(&source, WAV2VEC_SAMPLE_RATE).unwrap();
         assert_eq!(output.sample_rate, WAV2VEC_SAMPLE_RATE);
         assert_eq!(output.samples.len(), WAV2VEC_SAMPLE_RATE as usize);
         assert!(output.samples.iter().all(|sample| sample.is_finite()));
-        assert!(output.samples.iter().map(|sample| sample.abs()).fold(0.0, f32::max) > 0.4);
+        assert!(
+            output
+                .samples
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0, f32::max)
+                > 0.4
+        );
     }
 
     fn test_waveform() -> Vec<f32> {
@@ -574,13 +645,15 @@ mod tests {
 
     #[test]
     fn seamless_features_have_expected_shape_and_normalization() {
-        let features = seamless_m4t_features(
-            &AudioBuffer::new(test_waveform(), WAV2VEC_SAMPLE_RATE)
-        ).unwrap();
+        let features =
+            seamless_m4t_features(&AudioBuffer::new(test_waveform(), WAV2VEC_SAMPLE_RATE)).unwrap();
         assert_eq!(features.frames, 49);
         assert_eq!(features.input_features.len(), 49 * 160);
         assert_eq!(features.attention_mask, vec![1; 49]);
-        assert!(features.input_features.iter().all(|value| value.is_finite()));
+        assert!(features
+            .input_features
+            .iter()
+            .all(|value| value.is_finite()));
         let official = [
             (0, 0.90362066f32),
             (1, 0.80721146),
@@ -612,21 +685,28 @@ mod tests {
         let mel = reference_mel(&AudioBuffer::new(samples, INDEXTTS_SAMPLE_RATE)).unwrap();
         assert_eq!(mel.len(), 80 * 86);
         let official = [
-            (0, -0.81806934f32), (1, -2.5950215), (79, -6.8224835),
-            (80, -6.619554), (159, -5.7012401), (160, -5.6991324),
-            (777, -6.9009333), (6879, -7.3257093),
+            (0, -0.81806934f32),
+            (1, -2.5950215),
+            (79, -6.8224835),
+            (80, -6.619554),
+            (159, -5.701_24),
+            (160, -5.6991324),
+            (777, -6.9009333),
+            (6879, -7.3257093),
         ];
         for (index, expected) in official {
-            assert!((mel[index] - expected).abs() < 2e-3,
-                "mel {index}: Rust={}, Python={expected}", mel[index]);
+            assert!(
+                (mel[index] - expected).abs() < 2e-3,
+                "mel {index}: Rust={}, Python={expected}",
+                mel[index]
+            );
         }
     }
 
     #[test]
     fn campplus_fbank_matches_torchaudio_reference() {
-        let features = campplus_fbank(
-            &AudioBuffer::new(test_waveform(), WAV2VEC_SAMPLE_RATE)
-        ).unwrap();
+        let features =
+            campplus_fbank(&AudioBuffer::new(test_waveform(), WAV2VEC_SAMPLE_RATE)).unwrap();
         assert_eq!(features.len(), 98 * 80);
         let official = [
             (0, 1.4589176f32),

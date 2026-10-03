@@ -320,7 +320,11 @@ impl SemanticCodes {
     /// Get semantic tokens up to (but not including) stop token
     pub fn semantic_tokens_until_stop(&self) -> Vec<u32> {
         match self.find_stop_token() {
-            Some(pos) => self.tokens[..pos].iter().copied().filter(|&t| t < 8192).collect(),
+            Some(pos) => self.tokens[..pos]
+                .iter()
+                .copied()
+                .filter(|&t| t < 8192)
+                .collect(),
             None => self.tokens.iter().copied().filter(|&t| t < 8192).collect(),
         }
     }
@@ -413,17 +417,17 @@ impl AudioBuffer {
                 bits_per_sample: 16,
                 sample_format: hound::SampleFormat::Int,
             };
-            let mut writer = hound::WavWriter::new(
-                std::io::Cursor::new(&mut buffer),
-                spec,
-            ).map_err(|e| IndexTtsError::InvalidAudio(e.to_string()))?;
+            let mut writer = hound::WavWriter::new(std::io::Cursor::new(&mut buffer), spec)
+                .map_err(|e| IndexTtsError::InvalidAudio(e.to_string()))?;
 
             for sample in &self.samples {
                 let sample_i16 = (*sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                writer.write_sample(sample_i16)
+                writer
+                    .write_sample(sample_i16)
                     .map_err(|e| IndexTtsError::InvalidAudio(e.to_string()))?;
             }
-            writer.finalize()
+            writer
+                .finalize()
                 .map_err(|e| IndexTtsError::InvalidAudio(e.to_string()))?;
         }
         Ok(buffer)

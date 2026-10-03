@@ -90,12 +90,12 @@ impl GptConfig {
     /// Load config from YAML file (simplified parsing)
     pub fn from_yaml(path: &std::path::Path) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        
+
         let mut config = Self::default();
-        
+
         for line in content.lines() {
             let line = line.trim();
-            
+
             if let Some(rest) = line.strip_prefix("model_dim:") {
                 if let Ok(val) = rest.trim().parse::<usize>() {
                     config.n_embd = val;
@@ -138,11 +138,11 @@ impl GptConfig {
                 config.condition_type = rest.trim().trim_matches('"').to_string();
             }
         }
-        
+
         // Update dependent values
         config.n_positions = config.max_mel_tokens + config.max_text_tokens + 50;
         config.n_ctx = config.n_positions;
-        
+
         Ok(config)
     }
 
@@ -158,10 +158,7 @@ impl GptConfig {
 
     /// Check if config is valid
     pub fn validate(&self) -> bool {
-        self.n_embd % self.n_head == 0
-            && self.n_embd > 0
-            && self.n_head > 0
-            && self.n_layer > 0
+        self.n_embd % self.n_head == 0 && self.n_embd > 0 && self.n_head > 0 && self.n_layer > 0
     }
 }
 

@@ -63,8 +63,8 @@ impl IndexGpt {
     }
 
     fn calculate_params(config: &GptConfig) -> usize {
-        let embedding_params = config.n_vocab * config.n_embd
-            + (config.max_mel_tokens + 3) * config.n_embd;
+        let embedding_params =
+            config.n_vocab * config.n_embd + (config.max_mel_tokens + 3) * config.n_embd;
         let per_layer = 4 * config.n_embd * config.n_embd
             + 2 * config.n_embd * config.n_inner
             + 4 * config.n_embd
@@ -79,14 +79,17 @@ impl IndexGpt {
     pub fn load_weights(&mut self, path: &Path) -> CandleResult<()> {
         let weights = Weights::load(path, &self.device)
             .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-        weights.validate_greedy_contract()
+        weights
+            .validate_greedy_contract()
             .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         self.load_state_dict(weights.as_map())
     }
 
     pub fn load_state_dict(&mut self, weights: &HashMap<String, Tensor>) -> CandleResult<()> {
         let get = |name: &str| -> CandleResult<Tensor> {
-            weights.get(name).cloned()
+            weights
+                .get(name)
+                .cloned()
                 .ok_or_else(|| candle_core::Error::Msg(format!("missing weight: {name}")))
         };
 
@@ -147,13 +150,25 @@ impl IndexGpt {
         self.require_loaded()?;
         let (batch, _, hidden) = conditioning.dims3()?;
         if batch != 1 || hidden != self.config.n_embd {
-            candle_core::bail!("conditioning shape {:?}, expected [1, N, {}]", conditioning.dims(), self.config.n_embd)
+            candle_core::bail!(
+                "conditioning shape {:?}, expected [1, N, {}]",
+                conditioning.dims(),
+                self.config.n_embd
+            )
         }
-        let filtered: Vec<u32> = text_tokens.iter().copied()
-            .filter(|token| *token != self.config.start_text_token && *token != self.config.stop_text_token)
+        let filtered: Vec<u32> = text_tokens
+            .iter()
+            .copied()
+            .filter(|token| {
+                *token != self.config.start_text_token && *token != self.config.stop_text_token
+            })
             .collect();
         if filtered.len() > self.config.max_text_tokens {
-            candle_core::bail!("text has {} tokens, maximum is {}", filtered.len(), self.config.max_text_tokens)
+            candle_core::bail!(
+                "text has {} tokens, maximum is {}",
+                filtered.len(),
+                self.config.max_text_tokens
+            )
         }
         let mut ids = Vec::with_capacity(filtered.len() + 2);
         ids.push(self.config.start_text_token);
@@ -162,20 +177,19 @@ impl IndexGpt {
         let ids = Tensor::new(ids.as_slice(), &self.device)?.reshape((1, ids.len()))?;
         let positions: Vec<u32> = (0..ids.dim(1)? as u32).collect();
         let positions = Tensor::new(positions.as_slice(), &self.device)?;
-        let token_embeddings = self.text_embedding.forward(
-            &ids,
-            self.text_embedding_weight.as_ref().unwrap(),
-        )?;
-        let position_embeddings = self.text_position.forward(
-            &positions,
-            self.text_position_weight.as_ref().unwrap(),
-        )?;
+        let token_embeddings = self
+            .text_embedding
+            .forward(&ids, self.text_embedding_weight.as_ref().unwrap())?;
+        let position_embeddings = self
+            .text_position
+            .forward(&positions, self.text_position_weight.as_ref().unwrap())?;
         let language = Tensor::new(&[language_id], &self.device)?;
-        let language_embedding = self.language_embedding.forward(
-            &language,
-            self.language_embedding_weight.as_ref().unwrap(),
-        )?.reshape((1, 1, self.config.n_embd))?;
-        let text = token_embeddings.broadcast_add(&position_embeddings)?
+        let language_embedding = self
+            .language_embedding
+            .forward(&language, self.language_embedding_weight.as_ref().unwrap())?
+            .reshape((1, 1, self.config.n_embd))?;
+        let text = token_embeddings
+            .broadcast_add(&position_embeddings)?
             .broadcast_add(&language_embedding)?;
         Tensor::cat(&[conditioning, &text], 1)
     }
@@ -202,15 +216,18 @@ impl IndexGpt {
     ) -> CandleResult<(Tensor, Tensor)> {
         let (batch, prefix_len, hidden) = prefix.dims3()?;
         if hidden != self.config.n_embd {
-            candle_core::bail!("prefix hidden size {hidden}, expected {}", self.config.n_embd)
+            candle_core::bail!(
+                "prefix hidden size {hidden}, expected {}",
+                self.config.n_embd
+            )
         }
         let target_len = prefix_len + 1;
         let mut fake_ids = vec![1u32; batch * target_len];
         for row in 0..batch {
             fake_ids[row * target_len + target_len - 1] = self.config.start_mel_token;
         }
-        let fake_inputs = Tensor::new(fake_ids.as_slice(), &self.device)?
-            .reshape((batch, target_len))?;
+        let fake_inputs =
+            Tensor::new(fake_ids.as_slice(), &self.device)?.reshape((batch, target_len))?;
         self.store_mel_emb(prefix.clone());
         let mask = Tensor::ones((batch, target_len), DType::U32, &self.device)?;
         Ok((fake_inputs, mask))
@@ -233,7 +250,9 @@ impl IndexGpt {
         kv_cache: Option<&mut KvCache>,
     ) -> CandleResult<Tensor> {
         self.require_loaded()?;
-        let prefix = self.cached_prefix.as_ref()
+        let prefix = self
+            .cached_prefix
+            .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("prefix embeddings are not prepared".into()))?;
         let (batch, total_len) = input_ids.dims2()?;
         let (prefix_batch, prefix_len, _) = prefix.dims3()?;
@@ -258,13 +277,17 @@ impl IndexGpt {
         _position: usize,
     ) -> CandleResult<Tensor> {
         self.require_loaded()?;
-        let prefix_len = self.cached_prefix.as_ref()
+        let prefix_len = self
+            .cached_prefix
+            .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("prefix embeddings are not prepared".into()))?
             .dim(1)?;
         // The official wrapper leaves position 1 unused after the prefill start
         // token: decode uses attention_mask_len - cached_prefix_len, yielding 2
         // for the first generated semantic token.
-        let mel_position = kv_cache.seq_len().checked_sub(prefix_len)
+        let mel_position = kv_cache
+            .seq_len()
+            .checked_sub(prefix_len)
             .ok_or_else(|| candle_core::Error::Msg("KV cache is shorter than prefix".into()))?
             + 1;
         if mel_position >= self.mel_position.max_len {
@@ -276,14 +299,12 @@ impl IndexGpt {
     }
 
     fn embed_mel(&self, ids: &Tensor, positions: &Tensor) -> CandleResult<Tensor> {
-        let token = self.mel_embedding.forward(
-            ids,
-            self.mel_embedding_weight.as_ref().unwrap(),
-        )?;
-        let position = self.mel_position.forward(
-            positions,
-            self.mel_position_weight.as_ref().unwrap(),
-        )?;
+        let token = self
+            .mel_embedding
+            .forward(ids, self.mel_embedding_weight.as_ref().unwrap())?;
+        let position = self
+            .mel_position
+            .forward(positions, self.mel_position_weight.as_ref().unwrap())?;
         token.broadcast_add(&position)
     }
 
@@ -310,10 +331,18 @@ impl IndexGpt {
         Ok(())
     }
 
-    pub fn config(&self) -> &GptConfig { &self.config }
-    pub fn device(&self) -> &Device { &self.device }
-    pub fn is_loaded(&self) -> bool { self.loaded }
-    pub fn num_parameters(&self) -> usize { self.num_params }
+    pub fn config(&self) -> &GptConfig {
+        &self.config
+    }
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+    pub fn num_parameters(&self) -> usize {
+        self.num_params
+    }
 }
 
 pub fn create_position_ids(seq_len: usize, device: &Device) -> CandleResult<Tensor> {
@@ -375,7 +404,10 @@ mod tests {
             ("final_norm.weight".into(), o1(2)),
             ("final_norm.bias".into(), z1(2)),
             ("mel_head.weight".into(), z2((3, 2))),
-            ("mel_head.bias".into(), Tensor::new(&[1f32, 2., 3.], device).unwrap()),
+            (
+                "mel_head.bias".into(),
+                Tensor::new(&[1f32, 2., 3.], device).unwrap(),
+            ),
         ])
     }
 
@@ -390,7 +422,9 @@ mod tests {
         let text = Tensor::new(&[[0u32]], &device).unwrap();
         let (input_ids, mask) = model.prepare_inputs(&prefix, &text, None).unwrap();
         let mut cache = KvCache::new(8, device.clone());
-        let logits = model.prefill(&input_ids, Some(&mask), None, Some(&mut cache)).unwrap();
+        let logits = model
+            .prefill(&input_ids, Some(&mask), None, Some(&mut cache))
+            .unwrap();
         assert_eq!(logits.dims(), &[1, 6, 3]);
         assert_eq!(cache.seq_len(), 6);
         assert_eq!(logits.to_vec3::<f32>().unwrap()[0][1], vec![1., 2., 3.]);

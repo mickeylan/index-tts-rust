@@ -20,7 +20,7 @@ impl TextEmbedding {
     }
 
     /// Forward pass: lookup embeddings
-    /// 
+    ///
     /// Input: (batch, seq_len) token IDs
     /// Output: (batch, seq_len, dim) embeddings
     pub fn forward(&self, ids: &Tensor, weight: &Tensor) -> CandleResult<Tensor> {
@@ -92,7 +92,11 @@ impl LayerNorm {
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let bias = match &self.bias {
             Some(bias) => bias.clone(),
-            None => Tensor::zeros(self.weight.dims(), self.weight.dtype(), self.weight.device())?,
+            None => Tensor::zeros(
+                self.weight.dims(),
+                self.weight.dtype(),
+                self.weight.device(),
+            )?,
         };
         candle_nn::LayerNorm::new(self.weight.clone(), bias, self.eps as f64).forward(x)
     }
@@ -148,11 +152,11 @@ impl GptEmbeddings {
         pos_weight: &Tensor,
     ) -> CandleResult<Tensor> {
         let seq_len = input_ids.dim(1)?;
-        let pos_ids = create_position_ids(seq_len, &input_ids.device())?;
-        
+        let pos_ids = create_position_ids(seq_len, input_ids.device())?;
+
         let text_emb = self.text_emb.forward(input_ids, text_weight)?;
         let pos_emb = self.pos_emb.forward(&pos_ids, pos_weight)?;
-        
+
         // Add embeddings.
         text_emb + pos_emb
     }
@@ -177,7 +181,10 @@ mod tests {
         let ids = Tensor::new(&[[2u32, 0]], &device).unwrap();
         let output = emb.forward(&ids, &weight).unwrap();
         assert_eq!(output.dims(), &[1, 2, 2]);
-        assert_eq!(output.to_vec3::<f32>().unwrap(), vec![vec![vec![5., 6.], vec![1., 2.]]]);
+        assert_eq!(
+            output.to_vec3::<f32>().unwrap(),
+            vec![vec![vec![5., 6.], vec![1., 2.]]]
+        );
     }
 
     #[test]
@@ -187,7 +194,10 @@ mod tests {
         let bias = Tensor::new(&[1f32, -1., 0.5], &device).unwrap();
         let linear = Linear::new(weight, Some(bias));
         let input = Tensor::new(&[[2f32, 3.]], &device).unwrap();
-        assert_eq!(linear.forward(&input).unwrap().to_vec2::<f32>().unwrap(), vec![vec![3., 5., 5.5]]);
+        assert_eq!(
+            linear.forward(&input).unwrap().to_vec2::<f32>().unwrap(),
+            vec![vec![3., 5., 5.5]]
+        );
     }
 
     #[test]
