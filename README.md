@@ -119,6 +119,6 @@ $env:CGO_LDFLAGS="-L$pwd/target/release -lindextts"
 go -C bindings/go test ./...
 ```
 
-See the [IndexTTS Windows PowerShell workflow](docs/WINDOWS_POWERSHELL.md) for project operations. For PowerShell itself, see the separate [PowerShell command reference](docs/powershell/README.md).
+See the [IndexTTS Windows PowerShell workflow](docs/WINDOWS_POWERSHELL.md) for project operations, the [Go integration guide](docs/GO_INTEGRATION.md) for cgo/service integration, and the separate [PowerShell command reference](docs/powershell/README.md) for PowerShell itself.
 
 See [the implementation plan](2026-10-02-IndexTTS-2.5纯Rust推理库实施方案.md) for architectural background.
