@@ -10,6 +10,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+cuda = ["indextts-pipeline/cuda"]
+
 [[bin]]
 name = "indextts"
 path = "src/main.rs"

@@ -7,7 +7,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use indextts_audio::save_wav;
-use indextts_core::{DeviceConfig, GenerationConfig, Language, ModelConfig, Precision};
+use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};
 use indextts_pipeline::{IndexTtsPipeline, SemanticRuntime};
 use std::path::PathBuf;
 use tracing::info;
@@ -28,6 +28,14 @@ struct Cli {
     /// Log file directory
     #[arg(long, global = true)]
     log_dir: Option<PathBuf>,
+
+    /// Inference device
+    #[arg(long, global = true, value_enum, default_value = "auto")]
+    device: DeviceArg,
+
+    /// CUDA device index
+    #[arg(long, global = true, default_value = "0")]
+    device_index: usize,
 
     /// Command to execute
     #[command(subcommand)]
@@ -114,6 +122,24 @@ enum Commands {
     Version,
 }
 
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum DeviceArg {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl DeviceArg {
+    fn config(self, index: usize) -> DeviceConfig {
+        let kind = match self {
+            Self::Auto => DeviceKind::Auto,
+            Self::Cpu => DeviceKind::Cpu,
+            Self::Cuda => DeviceKind::Cuda,
+        };
+        DeviceConfig::new(kind, index)
+    }
+}
+
 #[derive(Clone, ValueEnum, Debug)]
 enum LanguageArg {
     Zh,
@@ -154,6 +180,7 @@ fn cmd_synth(
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    device: DeviceConfig,
 ) -> Result<()> {
     info!("Synthesizing: {}", text);
     info!("Language: {:?}", language);
@@ -162,7 +189,7 @@ fn cmd_synth(
     // Create pipeline
     let config = ModelConfig {
         model_dir: model,
-        device: DeviceConfig::default(),
+        device,
         precision: Precision::default(),
     };
 
@@ -204,9 +231,10 @@ fn cmd_tokens(
     text: String,
     language: LanguageArg,
     output: Option<PathBuf>,
+    device: DeviceConfig,
 ) -> Result<()> {
     let language: Language = language.into();
-    let mut runtime = SemanticRuntime::load(&model)?;
+    let mut runtime = SemanticRuntime::load_with_device(&model, device)?;
     let codes = runtime.generate(&text, language, &voice, 1815)?;
     let json = serde_json::to_string_pretty(&codes.tokens)?;
     if let Some(path) = output {
@@ -232,6 +260,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     setup_logging(cli.verbose, cli.log_dir);
+    let device = cli.device.config(cli.device_index);
 
     match cli.command {
         Commands::Synth {
@@ -261,6 +290,7 @@ fn main() -> Result<()> {
                 temperature,
                 top_k,
                 top_p,
+                device,
             )?;
         }
         Commands::Tokens {
@@ -270,7 +300,7 @@ fn main() -> Result<()> {
             language,
             output,
         } => {
-            cmd_tokens(model, voice, text, language, output)?;
+            cmd_tokens(model, voice, text, language, output, device)?;
         }
         Commands::Version => {
             println!("indextts {}", env!("CARGO_PKG_VERSION"));

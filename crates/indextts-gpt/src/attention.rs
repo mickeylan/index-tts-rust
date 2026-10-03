@@ -96,16 +96,23 @@ impl Gpt2Attention {
         };
         let key_len = key.dim(2)?;
 
+        // Candle's CUDA matmul requires contiguous batched operands after
+        // head splitting/transposition; the CPU backend accepts these strides.
+        let query = query.contiguous()?;
+        let key_transposed = key.transpose(2, 3)?.contiguous()?;
+        let value = value.contiguous()?;
         let scores = query
-            .matmul(&key.transpose(2, 3)?)?
+            .matmul(&key_transposed)?
             .affine(1.0 / (self.head_dim as f64).sqrt(), 0.0)?;
         let mask = create_causal_mask_for_lengths(query_len, key_len, scores.device())?
             .reshape((1, 1, query_len, key_len))?;
         let scores = scores.broadcast_add(&mask)?;
         let probabilities = candle_nn::ops::softmax(&scores, D::Minus1)?;
         let context = probabilities
+            .contiguous()?
             .matmul(&value)?
             .permute((0, 2, 1, 3))?
+            .contiguous()?
             .reshape((batch, query_len, n_embd))?;
         c_proj.forward(&context)
     }

@@ -10,6 +10,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+cuda = ["candle-core/cuda", "indextts-gpt/cuda", "indextts-ort/cuda"]
+
 [dependencies]
 indextts-core = { workspace = true }
 indextts-text = { workspace = true }

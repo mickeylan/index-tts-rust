@@ -10,6 +10,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+cuda = ["ort/cuda"]
+
 [dependencies]
 indextts-core = { workspace = true }
 thiserror = { workspace = true }

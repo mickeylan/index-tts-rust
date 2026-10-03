@@ -4,20 +4,23 @@ Python-free **runtime** for IndexTTS-2.5. Rust owns preprocessing, tokenization,
 
 ## Current support
 
-- Windows and Linux CPU runtime
+- Windows CPU runtime and validated NVIDIA CUDA runtime (RTX 4070, CUDA 12.8)
 - Chinese-first greedy synthesis from text + reference WAV to 22.05 kHz mono WAV
 - Candle GPT with KV cache and exact fixed-fixture semantic-token parity
 - Wav2Vec2-BERT, CAMPPlus, conditioning, semantic codec, length regulator, bucketed DiT and bucketed BigVGAN through ONNX Runtime
 - Rust API, CLI, C ABI, and Go wrapper
 - Fixed frame buckets (default export: 256, 512, 1024, 2048)
 
-Not yet validated: CUDA execution, sampling/beam search, non-Chinese quality, and every possible long-input bucket. CUDA is deliberately rejected by the current public configuration rather than silently falling back to CPU.
+Not yet validated: sampling/beam search, non-Chinese quality, and every possible long-input bucket. CUDA is opt-in at build and runtime.
 
 ## Build
 
 ```powershell
 cargo build --release -p indextts-cli
 cargo build --release -p indextts-ffi
+
+# CUDA build (requires CUDA 12.8 and MSVC on Windows)
+cargo build --release -p indextts-cli --features cuda
 ```
 
 The ONNX Runtime dynamic library must be discoverable by the operating system. Alternatively set `ORT_DYLIB_PATH` to the matching ONNX Runtime 2.0.0-rc.13 library.
@@ -39,7 +42,7 @@ The command exports all runtime models, tokenizer assets, frame buckets, and a S
 ## CLI
 
 ```powershell
-target\release\indextts.exe synth `
+target\release\indextts.exe --device cuda --device-index 0 synth `
   --model E:\models\indextts25-rust `
   --voice reference.wav `
   --text "相信姐姐。" `
@@ -99,7 +102,7 @@ audio, err := model.Generate(voice, "你好", indextts.Options{Language: "ZH"})
 
 ## Limitations
 
-- Runtime is currently CPU-only. CUDA needs a CUDA toolkit/GPU, Candle CUDA feature wiring, ORT CUDA EP configuration, and hardware validation.
+- CUDA currently targets the CUDA 12 ABI. CUDA 12.8, cuDNN 9, and a CUDA-enabled ONNX Runtime must be discoverable through `PATH`; CPU remains available with `--device cpu`.
 - Inference is greedy only (`do_sample=false`, `num_beams=1`).
 - WAV input is the supported public contract.
 - Output quality must be assessed with appropriately licensed real speech references; synthetic test tones only establish execution and file correctness.

@@ -55,11 +55,27 @@ pub struct ReferenceEncoder {
 
 impl ReferenceEncoder {
     pub fn load(model_dir: &Path) -> TtsResult<Self> {
+        Self::load_with_device(model_dir, None)
+    }
+
+    fn load_with_device(model_dir: &Path, cuda_device: Option<usize>) -> TtsResult<Self> {
         Ok(Self {
-            wav2vec: OnnxSession::load(&OnnxModel::Wav2Vec2Bert.path(model_dir))?,
-            campplus: OnnxSession::load(&OnnxModel::Campplus.path(model_dir))?,
-            gpt_conditioning: OnnxSession::load(&OnnxModel::GptConditioning.path(model_dir))?,
-            length_regulator: OnnxSession::load(&OnnxModel::LengthRegulator.path(model_dir))?,
+            wav2vec: OnnxSession::load_with_device(
+                &OnnxModel::Wav2Vec2Bert.path(model_dir),
+                cuda_device,
+            )?,
+            campplus: OnnxSession::load_with_device(
+                &OnnxModel::Campplus.path(model_dir),
+                cuda_device,
+            )?,
+            gpt_conditioning: OnnxSession::load_with_device(
+                &OnnxModel::GptConditioning.path(model_dir),
+                cuda_device,
+            )?,
+            length_regulator: OnnxSession::load_with_device(
+                &OnnxModel::LengthRegulator.path(model_dir),
+                cuda_device,
+            )?,
             stats: Wav2VecStats::load(&model_dir.join("wav2vec2bert_stats.safetensors"))?,
         })
     }
@@ -142,20 +158,75 @@ pub struct SemanticRuntime {
 
 impl SemanticRuntime {
     pub fn load(model_dir: &Path) -> TtsResult<Self> {
-        let device = Device::Cpu;
+        Self::load_with_device(
+            model_dir,
+            indextts_core::DeviceConfig::new(indextts_core::DeviceKind::Cpu, 0),
+        )
+    }
+
+    pub fn load_with_device(
+        model_dir: &Path,
+        device_config: indextts_core::DeviceConfig,
+    ) -> TtsResult<Self> {
+        let cuda_device = match device_config.kind {
+            indextts_core::DeviceKind::Cpu => None,
+            indextts_core::DeviceKind::Cuda => Some(device_config.index),
+            indextts_core::DeviceKind::Auto => {
+                #[cfg(feature = "cuda")]
+                {
+                    Some(device_config.index)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    None
+                }
+            }
+        };
+        let device = if let Some(index) = cuda_device {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(index).map_err(|error| {
+                    indextts_core::IndexTtsError::BackendFailure(error.to_string())
+                })?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = index;
+                return Err(indextts_core::IndexTtsError::BackendFailure(
+                    "CUDA requested, but indextts-pipeline was built without the cuda feature"
+                        .into(),
+                ));
+            }
+        } else {
+            Device::Cpu
+        };
         let mut gpt = IndexGpt::new(GptConfig::default(), device)
             .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
         gpt.load_weights(&model_dir.join("gpt.safetensors"))
             .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
         Ok(Self {
-            reference: ReferenceEncoder::load(model_dir)?,
+            reference: ReferenceEncoder::load_with_device(model_dir, cuda_device)?,
             tokenizer: IndexTtsTokenizer::from_dir(model_dir)?,
             normalizer: TextNormalizer::new(),
             gpt,
-            semantic_codec: OnnxSession::load(&OnnxModel::SemanticCodec.path(model_dir))?,
-            length_regulator: OnnxSession::load(&OnnxModel::LengthRegulator.path(model_dir))?,
-            dit_buckets: DitBuckets::load(model_dir, &[256, 512, 1024, 2048, 4096, 8192])?,
-            bigvgan_buckets: BigVganBuckets::load(model_dir, &[256, 512, 1024, 2048, 4096, 8192])?,
+            semantic_codec: OnnxSession::load_with_device(
+                &OnnxModel::SemanticCodec.path(model_dir),
+                cuda_device,
+            )?,
+            length_regulator: OnnxSession::load_with_device(
+                &OnnxModel::LengthRegulator.path(model_dir),
+                cuda_device,
+            )?,
+            dit_buckets: DitBuckets::load_with_device(
+                model_dir,
+                &[256, 512, 1024, 2048, 4096, 8192],
+                cuda_device,
+            )?,
+            bigvgan_buckets: BigVganBuckets::load_with_device(
+                model_dir,
+                &[256, 512, 1024, 2048, 4096, 8192],
+                cuda_device,
+            )?,
         })
     }
 
@@ -335,7 +406,10 @@ impl IndexTtsPipeline {
             "Loading IndexTTS-2.5 models from {:?}",
             self.config.model_dir
         );
-        self.runtime = Some(Mutex::new(SemanticRuntime::load(&self.config.model_dir)?));
+        self.runtime = Some(Mutex::new(SemanticRuntime::load_with_device(
+            &self.config.model_dir,
+            self.config.device,
+        )?));
         info!("Model loading complete");
         Ok(())
     }

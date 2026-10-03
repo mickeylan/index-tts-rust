@@ -10,10 +10,15 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:cudarc"]
+
 [dependencies]
 indextts-core = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+cudarc = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

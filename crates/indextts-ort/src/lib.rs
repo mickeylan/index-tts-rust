@@ -106,16 +106,37 @@ pub struct OnnxSession {
 
 impl OnnxSession {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with_device(path, None)
+    }
+
+    pub fn load_with_device(path: &Path, cuda_device: Option<usize>) -> Result<Self> {
         if !path.is_file() {
             return Err(IndexTtsError::InvalidModel(format!(
                 "ONNX model not found: {}",
                 path.display()
             )));
         }
-        let session = Session::builder()
-            .map_err(ort_error)?
-            .commit_from_file(path)
-            .map_err(ort_error)?;
+        let mut builder = Session::builder().map_err(ort_error)?;
+        if let Some(device) = cuda_device {
+            #[cfg(feature = "cuda")]
+            {
+                builder = builder
+                    .with_execution_providers([ort::ep::CUDA::default()
+                        .with_device_id(device as i32)
+                        .build()])
+                    .map_err(|error| {
+                        IndexTtsError::BackendFailure(format!("ONNX Runtime: {error}"))
+                    })?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = device;
+                return Err(IndexTtsError::BackendFailure(
+                    "CUDA requested, but indextts-ort was built without the cuda feature".into(),
+                ));
+            }
+        }
+        let session = builder.commit_from_file(path).map_err(ort_error)?;
         let input_names = session
             .inputs()
             .iter()
@@ -450,6 +471,14 @@ pub struct DitBuckets {
 
 impl DitBuckets {
     pub fn load(model_dir: &Path, frame_sizes: &[usize]) -> Result<Self> {
+        Self::load_with_device(model_dir, frame_sizes, None)
+    }
+
+    pub fn load_with_device(
+        model_dir: &Path,
+        frame_sizes: &[usize],
+        cuda_device: Option<usize>,
+    ) -> Result<Self> {
         let mut buckets = Vec::new();
         for &frames in frame_sizes {
             let path = model_dir
@@ -459,7 +488,7 @@ impl DitBuckets {
             if path.is_file() {
                 buckets.push(DitBucket {
                     frames,
-                    session: OnnxSession::load(&path)?,
+                    session: OnnxSession::load_with_device(&path, cuda_device)?,
                 });
             }
         }
@@ -736,6 +765,14 @@ pub struct BigVganBuckets {
 
 impl BigVganBuckets {
     pub fn load(model_dir: &Path, frame_sizes: &[usize]) -> Result<Self> {
+        Self::load_with_device(model_dir, frame_sizes, None)
+    }
+
+    pub fn load_with_device(
+        model_dir: &Path,
+        frame_sizes: &[usize],
+        cuda_device: Option<usize>,
+    ) -> Result<Self> {
         let mut buckets = Vec::new();
         for &frames in frame_sizes {
             let path = model_dir
@@ -745,7 +782,7 @@ impl BigVganBuckets {
             if path.is_file() {
                 buckets.push(DitBucket {
                     frames,
-                    session: OnnxSession::load(&path)?,
+                    session: OnnxSession::load_with_device(&path, cuda_device)?,
                 });
             }
         }
