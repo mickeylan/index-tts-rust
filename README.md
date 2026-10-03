@@ -119,4 +119,6 @@ $env:CGO_LDFLAGS="-L$pwd/target/release -lindextts"
 go -C bindings/go test ./...
 ```
 
+See the [Windows PowerShell guide](docs/WINDOWS_POWERSHELL.md) for complete build, export, CPU/GPU inference, testing, and packaging commands.
+
 See [the implementation plan](2026-10-02-IndexTTS-2.5纯Rust推理库实施方案.md) for architectural background.
