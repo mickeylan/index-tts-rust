@@ -20,7 +20,11 @@ use indextts_gpt::{Generator, GptConfig, GreedyGenerator, IndexGpt};
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
 use indextts_audio::{campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features, save_wav};
-use indextts_ort::{run_campplus, run_gpt_conditioning, run_length_regulator, run_wav2vec2bert, OnnxModel, OnnxSession, Tensor, Wav2VecStats};
+use indextts_ort::{
+    run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec,
+    run_wav2vec2bert, solve_cfm_bucketed, DitBuckets, OnnxModel, OnnxSession, Tensor,
+    Wav2VecStats,
+};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn, instrument};
 
@@ -132,6 +136,9 @@ pub struct SemanticRuntime {
     tokenizer: IndexTtsTokenizer,
     normalizer: TextNormalizer,
     gpt: IndexGpt,
+    semantic_codec: OnnxSession,
+    length_regulator: OnnxSession,
+    dit_buckets: DitBuckets,
 }
 
 impl SemanticRuntime {
@@ -146,6 +153,9 @@ impl SemanticRuntime {
             tokenizer: IndexTtsTokenizer::from_dir(model_dir)?,
             normalizer: TextNormalizer::new(),
             gpt,
+            semantic_codec: OnnxSession::load(&OnnxModel::SemanticCodec.path(model_dir))?,
+            length_regulator: OnnxSession::load(&OnnxModel::LengthRegulator.path(model_dir))?,
+            dit_buckets: DitBuckets::load(model_dir, &[256, 512, 1024, 2048, 4096, 8192])?,
         })
     }
 
@@ -186,7 +196,73 @@ impl SemanticRuntime {
         }
         Ok(SemanticCodes::new(output.tokens))
     }
+
+    pub fn generate_mel(
+        &self,
+        codes: &SemanticCodes,
+        reference: &ReferenceConditioning,
+        duration_factor: f32,
+        seed: u64,
+    ) -> TtsResult<Tensor> {
+        if !(0.5..=2.0).contains(&duration_factor) {
+            return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+                "duration factor {duration_factor} is outside [0.5, 2.0]"
+            )));
+        }
+        let decoded = run_semantic_codec(&self.semantic_codec, &codes.tokens)?;
+        let decoded_frames = decoded.shape()[1] as usize;
+        let generated_frames = (decoded_frames as f32 * 1.72 * duration_factor) as usize;
+        let generated_condition = run_length_regulator(
+            &self.length_regulator,
+            decoded,
+            generated_frames,
+        )?;
+        let condition = concat_conditions(&reference.prompt_condition, &generated_condition)?;
+        let full_mel = solve_cfm_bucketed(
+            &self.dit_buckets,
+            &condition,
+            &reference.reference_mel,
+            &reference.speaker_style,
+            25,
+            0.7,
+            seed,
+        )?;
+        crop_reference_mel(&full_mel, reference.reference_mel.shape()[2] as usize)
+    }
 }
+
+fn concat_conditions(left: &Tensor, right: &Tensor) -> TtsResult<Tensor> {
+    let left_frames = left.shape()[1] as usize;
+    let right_frames = right.shape()[1] as usize;
+    if left.shape() != [1, left_frames as i64, 512]
+        || right.shape() != [1, right_frames as i64, 512]
+    {
+        return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+            "invalid condition shapes {:?} and {:?}", left.shape(), right.shape()
+        )));
+    }
+    let mut data = Vec::with_capacity((left_frames + right_frames) * 512);
+    data.extend_from_slice(left.as_slice());
+    data.extend_from_slice(right.as_slice());
+    Ok(Tensor::new(data, vec![1, (left_frames + right_frames) as i64, 512]))
+}
+
+fn crop_reference_mel(mel: &Tensor, prompt_frames: usize) -> TtsResult<Tensor> {
+    let total_frames = mel.shape()[2] as usize;
+    if mel.shape()[..2] != [1, 80] || prompt_frames >= total_frames {
+        return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+            "cannot crop mel {:?} at frame {prompt_frames}", mel.shape()
+        )));
+    }
+    let generated_frames = total_frames - prompt_frames;
+    let mut data = Vec::with_capacity(80 * generated_frames);
+    for channel in 0..80 {
+        let offset = channel * total_frames + prompt_frames;
+        data.extend_from_slice(&mel.as_slice()[offset..offset + generated_frames]);
+    }
+    Ok(Tensor::new(data, vec![1, 80, generated_frames as i64]))
+}
+
 
 fn ort_f32_to_candle(tensor: &Tensor, device: &Device) -> TtsResult<CandleTensor> {
     let shape: Vec<usize> = tensor.shape().iter().map(|dimension| *dimension as usize).collect();

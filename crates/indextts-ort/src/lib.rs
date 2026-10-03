@@ -407,8 +407,15 @@ pub fn solve_cfm_bucketed(
     })? as usize;
     let bucket = buckets.select(required_frames)?;
     let padded_condition = pad_condition(condition, bucket.frames)?;
-    let output = solve_cfm(
-        &bucket.session, &padded_condition, prompt_mel, style, steps, cfg_rate, seed,
+    let output = solve_cfm_inner(
+        &bucket.session,
+        &padded_condition,
+        prompt_mel,
+        style,
+        steps,
+        cfg_rate,
+        seed,
+        required_frames,
     )?;
     crop_mel_frames(&output, required_frames)
 }
@@ -458,6 +465,25 @@ pub fn solve_cfm(
     cfg_rate: f32,
     seed: u64,
 ) -> Result<Tensor> {
+    let active_frames = *condition.shape().get(1).ok_or_else(|| {
+        IndexTtsError::BackendFailure("CFM condition has no time dimension".into())
+    })? as usize;
+    solve_cfm_inner(
+        session, condition, prompt_mel, style, steps, cfg_rate, seed, active_frames,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_cfm_inner(
+    session: &OnnxSession,
+    condition: &Tensor,
+    prompt_mel: &Tensor,
+    style: &Tensor,
+    steps: usize,
+    cfg_rate: f32,
+    seed: u64,
+    active_frames: usize,
+) -> Result<Tensor> {
     if steps == 0 { return Err(IndexTtsError::BackendFailure("CFM steps must be positive".into())); }
     let Tensor::F32 { data: condition_data, shape: condition_shape } = condition else {
         return Err(IndexTtsError::BackendFailure("CFM condition must be f32".into()));
@@ -478,8 +504,10 @@ pub fn solve_cfm(
     }
     let total_frames = condition_shape[1] as usize;
     let prompt_frames = prompt_shape[2] as usize;
-    if prompt_frames > total_frames {
-        return Err(IndexTtsError::BackendFailure("CFM prompt exceeds condition length".into()));
+    if prompt_frames > active_frames || active_frames > total_frames {
+        return Err(IndexTtsError::BackendFailure(format!(
+            "invalid CFM active length: prompt={prompt_frames}, active={active_frames}, total={total_frames}"
+        )));
     }
     let frame_values = 80 * total_frames;
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -500,7 +528,7 @@ pub fn solve_cfm(
             session,
             Tensor::new(stacked_x, vec![2, 80, total_frames as i64]),
             Tensor::new(stacked_prompt, vec![2, 80, total_frames as i64]),
-            Tensor::new_i64(vec![total_frames as i64, total_frames as i64], vec![2]),
+            Tensor::new_i64(vec![active_frames as i64, active_frames as i64], vec![2]),
             Tensor::new(vec![step as f32 * dt; 2], vec![2]),
             Tensor::new(stacked_style, vec![2, 192]),
             Tensor::new(stacked_condition, vec![2, total_frames as i64, 512]),
