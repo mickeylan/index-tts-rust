@@ -555,6 +555,65 @@ pub fn run_bigvgan(session: &OnnxSession, mel: Tensor) -> Result<Tensor> {
         .into_iter().next().ok_or_else(|| IndexTtsError::BackendFailure("missing BigVGAN output".into()))
 }
 
+#[derive(Debug, Clone)]
+pub struct BigVganBuckets {
+    buckets: Vec<DitBucket>,
+}
+
+impl BigVganBuckets {
+    pub fn load(model_dir: &Path, frame_sizes: &[usize]) -> Result<Self> {
+        let mut buckets = Vec::new();
+        for &frames in frame_sizes {
+            let path = model_dir.join("onnx").join("bigvgan").join(format!("model-{frames}.onnx"));
+            if path.is_file() {
+                buckets.push(DitBucket { frames, session: OnnxSession::load(&path)? });
+            }
+        }
+        buckets.sort_by_key(|bucket| bucket.frames);
+        if buckets.is_empty() {
+            return Err(IndexTtsError::InvalidModel(format!(
+                "no BigVGAN frame buckets found under {}", model_dir.join("onnx/bigvgan").display()
+            )));
+        }
+        Ok(Self { buckets })
+    }
+
+    pub fn synthesize(&self, mel: &Tensor) -> Result<Tensor> {
+        let frames = *mel.shape().get(2).ok_or_else(|| {
+            IndexTtsError::BackendFailure("mel has no time dimension".into())
+        })? as usize;
+        let bucket = self.buckets.iter().find(|bucket| bucket.frames >= frames).ok_or_else(|| {
+            IndexTtsError::BackendFailure(format!("no BigVGAN bucket can fit {frames} frames"))
+        })?;
+        let padded = pad_mel(mel, bucket.frames)?;
+        let audio = run_bigvgan(&bucket.session, padded)?;
+        let required_samples = frames * 256;
+        let Tensor::F32 { data, shape } = audio else {
+            return Err(IndexTtsError::BackendFailure("BigVGAN output must be f32".into()));
+        };
+        if shape.len() != 3 || shape[0] != 1 || shape[1] != 1 || data.len() < required_samples {
+            return Err(IndexTtsError::BackendFailure(format!("invalid BigVGAN output {shape:?}")));
+        }
+        Ok(Tensor::new(data[..required_samples].to_vec(), vec![1, 1, required_samples as i64]))
+    }
+}
+
+fn pad_mel(mel: &Tensor, frames: usize) -> Result<Tensor> {
+    let Tensor::F32 { data, shape } = mel else {
+        return Err(IndexTtsError::BackendFailure("mel must be f32".into()));
+    };
+    if shape.len() != 3 || shape[0] != 1 || shape[1] != 80 || shape[2] as usize > frames {
+        return Err(IndexTtsError::BackendFailure(format!("cannot pad mel {shape:?} to {frames}")));
+    }
+    let source_frames = shape[2] as usize;
+    let mut padded = vec![0f32; 80 * frames];
+    for channel in 0..80 {
+        padded[channel * frames..channel * frames + source_frames]
+            .copy_from_slice(&data[channel * source_frames..(channel + 1) * source_frames]);
+    }
+    Ok(Tensor::new(padded, vec![1, 80, frames as i64]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

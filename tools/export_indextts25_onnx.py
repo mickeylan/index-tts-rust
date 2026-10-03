@@ -511,11 +511,101 @@ def export_dit(source: Path, model_dir: Path, output: Path, frames: int) -> None
         raise RuntimeError(f"DiT ONNX parity failed: max={max_error}, mean={mean_error}")
 
 
+def export_bigvgan(source: Path, model_dir: Path, output: Path, frames: int) -> None:
+    sys.path.insert(0, str(source.resolve()))
+    from indextts.s2mel.modules.bigvgan import bigvgan
+
+    if frames < 16 or frames > 8192:
+        raise ValueError("fixed BigVGAN frame bucket must be in [16, 8192]")
+    model = bigvgan.BigVGAN.from_pretrained(
+        str(model_dir / "hf_cache" / "bigvgan"), use_cuda_kernel=False
+    )
+    model.remove_weight_norm()
+    model.eval()
+
+    # Replace alias-free activation wrappers with an ONNX-safe equivalent.
+    # Channel-expanded filters are materialized here so Conv kernels/groups are
+    # static instead of derived from a traced tensor shape.
+    from torch import nn
+    from torch.nn import functional as F
+    from indextts.s2mel.modules.bigvgan.alias_free_activation.torch.act import Activation1d
+
+    class OnnxActivation1d(nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            self.act = original.act
+            self.channels = original.act.in_features
+            self.up_ratio = original.upsample.ratio
+            self.up_pad = original.upsample.pad
+            self.up_pad_left = original.upsample.pad_left
+            self.up_pad_right = original.upsample.pad_right
+            self.register_buffer(
+                "up_filter",
+                original.upsample.filter.expand(self.channels, -1, -1).contiguous(),
+            )
+            lowpass = original.downsample.lowpass
+            self.down_stride = lowpass.stride
+            self.down_pad_left = lowpass.pad_left
+            self.down_pad_right = lowpass.pad_right
+            self.register_buffer(
+                "down_filter",
+                lowpass.filter.expand(self.channels, -1, -1).contiguous(),
+            )
+
+        def forward(self, x):
+            x = F.pad(x, (self.up_pad, self.up_pad), mode="replicate")
+            x = self.up_ratio * F.conv_transpose1d(
+                x, self.up_filter, stride=self.up_ratio, groups=self.channels
+            )
+            x = x[..., self.up_pad_left:-self.up_pad_right]
+            x = self.act(x)
+            x = F.pad(x, (self.down_pad_left, self.down_pad_right), mode="replicate")
+            return F.conv1d(
+                x, self.down_filter, stride=self.down_stride, groups=self.channels
+            )
+
+    def replace_activations(module):
+        for name, child in list(module.named_children()):
+            if isinstance(child, Activation1d):
+                setattr(module, name, OnnxActivation1d(child))
+            else:
+                replace_activations(child)
+
+    replace_activations(model)
+    torch.manual_seed(1234)
+    mel = torch.randn(1, 80, frames)
+    with torch.no_grad():
+        expected = model(mel).cpu().numpy()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        model,
+        (mel,),
+        str(output),
+        input_names=["mel"],
+        output_names=["audio"],
+        opset_version=17,
+        dynamo=False,
+    )
+
+    import onnxruntime as ort
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    actual = session.run(["audio"], {"mel": mel.numpy()})[0]
+    difference = np.abs(expected - actual)
+    maximum = float(np.max(difference))
+    mean = float(np.mean(difference))
+    print(
+        f"bigvgan output_shape={list(actual.shape)} max_abs_error={maximum:.9g} "
+        f"mean_abs_error={mean:.9g}"
+    )
+    if maximum > 0.01 or mean > 1e-4:
+        raise RuntimeError(f"BigVGAN ONNX parity failed: max={maximum}, mean={mean}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "component",
-        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator", "dit"],
+        choices=["campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator", "dit", "bigvgan"],
     )
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--model-dir", required=True, type=Path)
@@ -535,6 +625,8 @@ def main() -> None:
         export_length_regulator(args.source, args.model_dir, args.output)
     elif args.component == "dit":
         export_dit(args.source, args.model_dir, args.output, args.frames)
+    elif args.component == "bigvgan":
+        export_bigvgan(args.source, args.model_dir, args.output, args.frames)
 
 
 if __name__ == "__main__":

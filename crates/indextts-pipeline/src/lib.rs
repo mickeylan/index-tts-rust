@@ -22,8 +22,8 @@ use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
 use indextts_audio::{campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features, save_wav};
 use indextts_ort::{
     run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec,
-    run_wav2vec2bert, solve_cfm_bucketed, DitBuckets, OnnxModel, OnnxSession, Tensor,
-    Wav2VecStats,
+    run_wav2vec2bert, solve_cfm_bucketed, BigVganBuckets, DitBuckets, OnnxModel,
+    OnnxSession, Tensor, Wav2VecStats,
 };
 use std::path::{Path, PathBuf};
 use tracing::{info, warn, instrument};
@@ -139,6 +139,7 @@ pub struct SemanticRuntime {
     semantic_codec: OnnxSession,
     length_regulator: OnnxSession,
     dit_buckets: DitBuckets,
+    bigvgan_buckets: BigVganBuckets,
 }
 
 impl SemanticRuntime {
@@ -156,6 +157,7 @@ impl SemanticRuntime {
             semantic_codec: OnnxSession::load(&OnnxModel::SemanticCodec.path(model_dir))?,
             length_regulator: OnnxSession::load(&OnnxModel::LengthRegulator.path(model_dir))?,
             dit_buckets: DitBuckets::load(model_dir, &[256, 512, 1024, 2048, 4096, 8192])?,
+            bigvgan_buckets: BigVganBuckets::load(model_dir, &[256, 512, 1024, 2048, 4096, 8192])?,
         })
     }
 
@@ -228,6 +230,19 @@ impl SemanticRuntime {
             seed,
         )?;
         crop_reference_mel(&full_mel, reference.reference_mel.shape()[2] as usize)
+    }
+
+    pub fn vocode(&self, mel: &Tensor) -> TtsResult<AudioBuffer> {
+        let waveform = self.bigvgan_buckets.synthesize(mel)?;
+        let samples: Vec<f32> = waveform.as_slice().iter()
+            .map(|sample| sample.clamp(-1.0, 1.0))
+            .collect();
+        if samples.is_empty() || samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(indextts_core::IndexTtsError::InvalidAudio(
+                "BigVGAN returned empty or non-finite audio".into(),
+            ));
+        }
+        Ok(AudioBuffer::new(samples, 22_050))
     }
 }
 
