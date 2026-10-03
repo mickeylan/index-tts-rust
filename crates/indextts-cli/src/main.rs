@@ -7,7 +7,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use indextts_core::{GenerationConfig, Language, ModelConfig, DeviceConfig, Precision};
-use indextts_pipeline::IndexTtsPipeline;
+use indextts_audio::save_wav;
+use indextts_pipeline::{IndexTtsPipeline, SemanticRuntime};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -147,11 +148,11 @@ fn cmd_synth(
     output: Option<PathBuf>,
     seed: u64,
     duration_factor: f32,
-    _do_sample: bool,
-    _num_beams: usize,
-    _temperature: f32,
-    _top_k: usize,
-    _top_p: f32,
+    do_sample: bool,
+    num_beams: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
 ) -> Result<()> {
     info!("Synthesizing: {}", text);
     info!("Language: {:?}", language);
@@ -173,37 +174,46 @@ fn cmd_synth(
         language: language.into(),
         seed,
         duration_factor,
-        do_sample: false,
-        num_beams: 1,
-        temperature: 1.0,
-        top_k: 50,
-        top_p: 0.95,
+        do_sample,
+        num_beams,
+        temperature,
+        top_k,
+        top_p,
         repetition_penalty: 1.0,
         max_length: None,
     };
 
-    // Generate (placeholder returns synthetic audio)
     let audio = pipeline.synthesize(&text, &voice, &gen_config)?;
     info!("Generated {} samples ({}s)", audio.len(), audio.duration());
 
-    // Save output (placeholder)
     let output_path = output.unwrap_or_else(|| {
         let stem = sanitize_filename(&text);
         PathBuf::from(format!("{}.wav", stem))
     });
 
-    info!("Output would be saved to: {:?}", output_path);
+    save_wav(&output_path, &audio)?;
+    info!("Saved output to: {:?}", output_path);
+    println!("{}", output_path.display());
     Ok(())
 }
 
 fn cmd_tokens(
-    _model: PathBuf,
-    _voice: PathBuf,
-    _text: String,
-    _language: LanguageArg,
-    _output: Option<PathBuf>,
+    model: PathBuf,
+    voice: PathBuf,
+    text: String,
+    language: LanguageArg,
+    output: Option<PathBuf>,
 ) -> Result<()> {
-    info!("Token generation not yet implemented");
+    let language: Language = language.into();
+    let mut runtime = SemanticRuntime::load(&model)?;
+    let codes = runtime.generate(&text, language, &voice, 1815)?;
+    let json = serde_json::to_string_pretty(&codes.tokens)?;
+    if let Some(path) = output {
+        std::fs::write(&path, format!("{json}\n"))?;
+        info!("Saved semantic codes to: {:?}", path);
+    } else {
+        println!("{json}");
+    }
     Ok(())
 }
 
@@ -254,7 +264,7 @@ fn main() -> Result<()> {
         }
         Commands::Version => {
             println!("indextts {}", env!("CARGO_PKG_VERSION"));
-            println!("IndexTTS-2.5 Pure Rust Implementation (placeholder)");
+            println!("IndexTTS-2.5 Rust runtime");
         }
     }
 

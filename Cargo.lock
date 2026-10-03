@@ -763,8 +763,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "indextts-audio",
  "indextts-core",
  "indextts-pipeline",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

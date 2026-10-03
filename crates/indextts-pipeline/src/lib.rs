@@ -10,23 +10,22 @@
 //!
 //! **Note**: This is a placeholder implementation.
 
-use anyhow::Result;
 use indextts_core::{
     AudioBuffer, DeviceConfig, GenerationConfig, Language,
-    ModelConfig, Result as TtsResult, SemanticCodes, SpeakerCondition,
+    ModelConfig, Result as TtsResult, SemanticCodes,
 };
 use candle_core::{Device, Tensor as CandleTensor};
 use indextts_gpt::{Generator, GptConfig, GreedyGenerator, IndexGpt};
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
-use indextts_audio::{campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features, save_wav};
+use indextts_audio::{campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features};
 use indextts_ort::{
     run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec,
     run_wav2vec2bert, solve_cfm_bucketed, BigVganBuckets, DitBuckets, OnnxModel,
     OnnxSession, Tensor, Wav2VecStats,
 };
-use std::path::{Path, PathBuf};
-use tracing::{info, warn, instrument};
+use std::{path::Path, sync::Mutex};
+use tracing::{info, instrument};
 
 /// Features extracted from a user-provided reference voice.
 #[derive(Debug, Clone)]
@@ -171,9 +170,22 @@ impl SemanticRuntime {
         if text.trim().is_empty() {
             return Err(indextts_core::IndexTtsError::InvalidText("text is empty".into()));
         }
+        let reference = self.reference.encode(reference_audio)?;
+        self.generate_with_reference(text, language, &reference, max_tokens)
+    }
+
+    pub fn generate_with_reference(
+        &mut self,
+        text: &str,
+        language: Language,
+        reference: &ReferenceConditioning,
+        max_tokens: usize,
+    ) -> TtsResult<SemanticCodes> {
+        if text.trim().is_empty() {
+            return Err(indextts_core::IndexTtsError::InvalidText("text is empty".into()));
+        }
         let normalized = self.normalizer.normalize(text, language)?;
         let tokens = self.tokenizer.tokenize_for_gpt(&normalized, language)?;
-        let reference = self.reference.encode(reference_audio)?;
         let conditioning = ort_f32_to_candle(&reference.gpt_conditioning, self.gpt.device())?;
         let prefix = self.gpt.build_prefix(&conditioning, &tokens, language_token_id(language))
             .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
@@ -285,43 +297,29 @@ fn ort_f32_to_candle(tensor: &Tensor, device: &Device) -> TtsResult<CandleTensor
         .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))
 }
 
-/// IndexTTS Pipeline (placeholder)
+/// End-to-end IndexTTS pipeline.
 #[derive(Debug)]
 pub struct IndexTtsPipeline {
-    /// Model configuration
     config: ModelConfig,
-    /// Text normalizer
-    normalizer: TextNormalizer,
-    /// Tokenizer
-    tokenizer: Option<IndexTtsTokenizer>,
-    /// Model loaded flag
-    loaded: bool,
+    runtime: Option<Mutex<SemanticRuntime>>,
 }
 
 impl IndexTtsPipeline {
     /// Create a new pipeline
     pub fn new(config: ModelConfig) -> Self {
-        Self {
-            config,
-            normalizer: TextNormalizer::new(),
-            tokenizer: None,
-            loaded: false,
-        }
+        Self { config, runtime: None }
     }
 
-    /// Load all models (placeholder)
+    /// Load all runtime models.
     #[instrument(skip(self))]
     pub fn load(&mut self) -> TtsResult<()> {
         info!("Loading IndexTTS-2.5 models from {:?}", self.config.model_dir);
-        
-        self.tokenizer = Some(IndexTtsTokenizer::from_dir(&self.config.model_dir)?);
-        self.loaded = true;
-        
-        info!("Model loading complete (placeholder)");
+        self.runtime = Some(Mutex::new(SemanticRuntime::load(&self.config.model_dir)?));
+        info!("Model loading complete");
         Ok(())
     }
 
-    /// Synthesize speech (placeholder)
+    /// Synthesize speech from text and a reference voice.
     #[instrument(skip(self, reference_audio_path))]
     pub fn synthesize(
         &self,
@@ -329,34 +327,31 @@ impl IndexTtsPipeline {
         reference_audio_path: &Path,
         gen_config: &GenerationConfig,
     ) -> TtsResult<AudioBuffer> {
-        info!("Synthesizing: {} (lang={})", text, gen_config.language.code());
-        
-        // 1. Normalize text
-        let normalized = self.normalizer.normalize(text, gen_config.language)?;
-        info!("Normalized text: {}", normalized);
-        
-        // 2. Tokenize
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+        if gen_config.do_sample || gen_config.num_beams != 1 {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "the end-to-end runtime currently supports greedy generation only".into(),
+            ));
+        }
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
             indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
         })?;
-        let tokens = tokenizer.tokenize_for_gpt(&normalized, gen_config.language)?;
-        info!("Tokenized to {} tokens", tokens.len());
-        
-        // 3. Process reference audio
-        let (_audio_16k, _audio_22k) = process_reference_audio(reference_audio_path)?;
-        
-        // 4. Placeholder: return synthetic audio
-        // TODO: Implement full pipeline
-        let samples: Vec<f32> = (0..22050).map(|i| (i as f32 / 22050.0) * 0.5).collect();
-        let audio = AudioBuffer::new(samples, 22050);
-        
-        info!("Synthesized placeholder audio: {} samples", audio.len());
-        Ok(audio)
+        let mut runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure("pipeline runtime lock was poisoned".into())
+        })?;
+        let reference = runtime.reference.encode(reference_audio_path)?;
+        let max_tokens = gen_config.max_length.unwrap_or(1815);
+        let codes = runtime.generate_with_reference(
+            text, gen_config.language, &reference, max_tokens,
+        )?;
+        let mel = runtime.generate_mel(
+            &codes, &reference, gen_config.duration_factor, gen_config.seed,
+        )?;
+        runtime.vocode(&mel)
     }
 
     /// Check if models are loaded
     pub fn is_loaded(&self) -> bool {
-        self.loaded
+        self.runtime.is_some()
     }
 
     /// Get model directory
@@ -365,7 +360,7 @@ impl IndexTtsPipeline {
     }
 }
 
-/// Convenience function to synthesize speech (placeholder)
+/// Convenience function to synthesize speech.
 pub fn synthesize(
     model_dir: &Path,
     text: &str,

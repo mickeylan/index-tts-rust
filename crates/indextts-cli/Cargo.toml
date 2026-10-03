@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 indextts-core = { workspace = true }
 indextts-pipeline = { workspace = true }
+indextts-audio = { workspace = true }
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 tracing = { workspace = true }
