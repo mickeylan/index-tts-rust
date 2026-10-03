@@ -11,7 +11,7 @@
 //! - Punctuation
 //! - Pronunciation annotations `<text|pronunciation>`
 
-use indextts_core::{IndexTtsError, Language, Result};
+use indextts_core::{Language, Result};
 use lazy_static::lazy_static;
 use regex::Regex;
 
@@ -20,15 +20,15 @@ lazy_static! {
     static ref ARABIC_NUMBER: Regex = Regex::new(r"\d+").unwrap();
     static ref DECIMAL: Regex = Regex::new(r"\d+\.\d+").unwrap();
     static ref PERCENTAGE: Regex = Regex::new(r"\d+%|百分之\d+").unwrap();
-    
+
     // Date/Time patterns
     static ref DATE_CHINESE: Regex = Regex::new(r"(\d{4})年(\d{1,2})月(\d{1,2})日?").unwrap();
     static ref TIME_24H: Regex = Regex::new(r"(\d{1,2}):(\d{2})").unwrap();
     static ref TIME_12H: Regex = Regex::new(r"(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)").unwrap();
-    
+
     // Phone number pattern
     static ref PHONE: Regex = Regex::new(r"\d{3,4}-?\d{7,8}").unwrap();
-    
+
     // Pronunciation annotation
     static ref PRONUNCIATION: Regex = Regex::new(r"<([^|]+)\|([^>]+)>").unwrap();
 }
@@ -76,10 +76,10 @@ impl TextNormalizer {
     /// Normalize text for the given language
     pub fn normalize(&self, text: &str, language: Language) -> Result<String> {
         let mut result = text.to_string();
-        
+
         // Handle pronunciation annotations first (preserve them)
         result = self.normalize_pronunciations(&result);
-        
+
         match language {
             Language::Zh => {
                 result = self.normalize_chinese(&result)?;
@@ -95,63 +95,63 @@ impl TextNormalizer {
                 result = result.trim().to_string();
             }
         }
-        
+
         Ok(result)
     }
 
     /// Normalize Chinese text
     fn normalize_chinese(&self, text: &str) -> Result<String> {
         let mut result = text.to_string();
-        
+
         // Normalize pronunciation annotations
         result = self.normalize_pronunciations(&result);
-        
+
         // Normalize numbers
         if self.normalize_numbers {
             result = self.normalize_numbers_chinese(&result);
         }
-        
+
         // Normalize dates
         if self.normalize_dates {
             result = self.normalize_dates_chinese(&result);
         }
-        
+
         // Normalize times
         if self.normalize_dates {
             result = self.normalize_times_chinese(&result);
         }
-        
+
         // Normalize phones
         if self.normalize_phones {
             result = self.normalize_phones_chinese(&result);
         }
-        
+
         // Normalize percentages
         if self.normalize_numbers {
             result = self.normalize_percentages_chinese(&result);
         }
-        
+
         // Clean up extra whitespace
         result = result.split_whitespace().collect::<Vec<_>>().join(" ");
-        
+
         Ok(result)
     }
 
     /// Normalize English text
     fn normalize_english(&self, text: &str) -> Result<String> {
         let mut result = text.to_string();
-        
+
         // Expand common abbreviations
         result = self.expand_abbreviations(&result);
-        
+
         // Normalize numbers
         if self.normalize_numbers {
             result = self.normalize_numbers_english(&result);
         }
-        
+
         // Clean up
         result = result.split_whitespace().collect::<Vec<_>>().join(" ");
-        
+
         Ok(result)
     }
 
@@ -175,7 +175,7 @@ impl TextNormalizer {
         // Replace Arabic digits with Chinese characters
         // Simple digit-by-digit conversion for now
         let digits = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
-        
+
         text.chars()
             .map(|c| {
                 if let Some(digit) = c.to_digit(10) {
@@ -208,7 +208,7 @@ impl TextNormalizer {
                 format!("{}点{}分", hour, minute)
             })
             .to_string();
-        
+
         TIME_12H
             .replace_all(&result, |caps: &regex::Captures| {
                 let hour = caps.get(1).map_or("", |m| m.as_str());
@@ -243,7 +243,7 @@ impl TextNormalizer {
             .replace_all(text, |caps: &regex::Captures| {
                 let m = caps.get(0).map_or("", |m| m.as_str());
                 if m.ends_with('%') {
-                    let num = &m[..m.len()-1];
+                    let num = &m[..m.len() - 1];
                     format!("百分之{}", num)
                 } else {
                     m.to_string()
@@ -270,7 +270,7 @@ impl TextNormalizer {
             ("U.K.", "United Kingdom"),
             ("etc.", "etcetera"),
         ];
-        
+
         let mut result = text.to_string();
         for (abbr, expansion) in abbreviations {
             result = result.replace(abbr, expansion);
@@ -298,7 +298,9 @@ mod tests {
     #[test]
     fn test_date_normalization() {
         let normalizer = TextNormalizer::new();
-        let result = normalizer.normalize("今天是2024年10月2日", Language::Zh).unwrap();
+        let result = normalizer
+            .normalize("今天是2024年10月2日", Language::Zh)
+            .unwrap();
         // Numbers should be converted to Chinese characters
         assert!(result.contains("二"));
         assert!(result.contains("年"));

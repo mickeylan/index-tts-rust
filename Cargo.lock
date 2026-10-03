@@ -789,9 +789,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cbindgen",
+ "indextts-audio",
  "indextts-core",
  "indextts-pipeline",
  "libc",
+ "once_cell",
  "thiserror 2.0.21",
 ]
 

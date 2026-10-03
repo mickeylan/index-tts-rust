@@ -10,9 +10,15 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+name = "indextts"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
 indextts-core = { workspace = true }
 indextts-pipeline = { workspace = true }
+indextts-audio = { workspace = true }
+once_cell = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"

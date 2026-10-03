@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Build a canonical IndexTTS-2.5 runtime model package."""
+
+import argparse
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+COMPONENTS = ("campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator")
+TOKENIZER_FILES = ("bpe.model", "multilingual_zh_ja_yue_char_del.tiktoken")
+
+
+def run(*args: object) -> None:
+    command = [sys.executable, *map(str, args)]
+    subprocess.run(command, check=True)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--checkpoints", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--buckets", nargs="+", type=int, default=[256, 512, 1024, 2048])
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    run(root / "tools/export_weights.py", "--input", args.checkpoints / "gpt.pth",
+        "--output", output / "gpt.safetensors", "--manifest", output / "gpt.manifest.json")
+    run(root / "tools/export_wav2vec_stats.py", "--input", args.checkpoints / "wav2vec2bert_stats.pt",
+        "--output", output / "wav2vec2bert_stats.safetensors")
+    for filename in TOKENIZER_FILES:
+        shutil.copy2(args.checkpoints / filename, output / filename)
+    exporter = root / "tools/export_indextts25_onnx.py"
+    for component in COMPONENTS:
+        run(exporter, component, "--source", args.source, "--model-dir", args.checkpoints,
+            "--output", output / "onnx" / component / "model.onnx")
+    for frames in sorted(set(args.buckets)):
+        for component in ("dit", "bigvgan"):
+            target = "s2mel" if component == "dit" else component
+            run(exporter, component, "--frames", frames, "--source", args.source,
+                "--model-dir", args.checkpoints,
+                "--output", output / "onnx" / target / f"model-{frames}.onnx")
+
+    files = sorted(path for path in output.rglob("*") if path.is_file())
+    manifest = {
+        "format_version": 1,
+        "model": "IndexTTS-2.5",
+        "runtime": "index-tts-rust",
+        "buckets": sorted(set(args.buckets)),
+        "sample_rate": 22050,
+        "files": {path.relative_to(output).as_posix(): {"bytes": path.stat().st_size, "sha256": sha256(path)} for path in files},
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote package with {len(files)} files to {output}")
+
+
+if __name__ == "__main__":
+    main()

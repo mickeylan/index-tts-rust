@@ -10,20 +10,21 @@
 //!
 //! **Note**: This is a placeholder implementation.
 
-use indextts_core::{
-    AudioBuffer, DeviceConfig, GenerationConfig, Language,
-    ModelConfig, Result as TtsResult, SemanticCodes,
-};
 use candle_core::{Device, Tensor as CandleTensor};
+use indextts_audio::{
+    campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features,
+};
+use indextts_core::{
+    AudioBuffer, DeviceConfig, GenerationConfig, Language, ModelConfig, Result as TtsResult,
+    SemanticCodes,
+};
 use indextts_gpt::{Generator, GptConfig, GreedyGenerator, IndexGpt};
+use indextts_ort::{
+    run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec, run_wav2vec2bert,
+    solve_cfm_bucketed, BigVganBuckets, DitBuckets, OnnxModel, OnnxSession, Tensor, Wav2VecStats,
+};
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
-use indextts_audio::{campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features};
-use indextts_ort::{
-    run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec,
-    run_wav2vec2bert, solve_cfm_bucketed, BigVganBuckets, DitBuckets, OnnxModel,
-    OnnxSession, Tensor, Wav2VecStats,
-};
 use std::{path::Path, sync::Mutex};
 use tracing::{info, instrument};
 
@@ -72,10 +73,7 @@ impl ReferenceEncoder {
                 seamless.input_features,
                 vec![1, seamless.frames as i64, 160],
             ),
-            Tensor::new_i64(
-                seamless.attention_mask,
-                vec![1, seamless.frames as i64],
-            ),
+            Tensor::new_i64(seamless.attention_mask, vec![1, seamless.frames as i64]),
         )?;
         let semantic = self.stats.normalize(semantic)?;
 
@@ -93,29 +91,30 @@ impl ReferenceEncoder {
         let mel = reference_mel(&audio_22k)?;
         let mel_frames = mel.len() / 80;
         let reference_mel = Tensor::new(mel, vec![1, 80, mel_frames as i64]);
-        let prompt_condition = run_length_regulator(
-            &self.length_regulator,
-            semantic.clone(),
-            mel_frames,
-        )?;
+        let prompt_condition =
+            run_length_regulator(&self.length_regulator, semantic.clone(), mel_frames)?;
         if semantic.shape().first() != Some(&1) || semantic.shape().last() != Some(&1024) {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
-                "invalid semantic conditioning shape {:?}", semantic.shape()
+                "invalid semantic conditioning shape {:?}",
+                semantic.shape()
             )));
         }
         if speaker_style.shape() != [1, 192] {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
-                "invalid speaker style shape {:?}", speaker_style.shape()
+                "invalid speaker style shape {:?}",
+                speaker_style.shape()
             )));
         }
         if gpt_conditioning.shape() != [1, 3, 1280] {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
-                "invalid GPT conditioning shape {:?}", gpt_conditioning.shape()
+                "invalid GPT conditioning shape {:?}",
+                gpt_conditioning.shape()
             )));
         }
         if prompt_condition.shape() != [1, mel_frames as i64, 512] {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
-                "invalid prompt condition shape {:?}", prompt_condition.shape()
+                "invalid prompt condition shape {:?}",
+                prompt_condition.shape()
             )));
         }
         Ok(ReferenceConditioning {
@@ -168,7 +167,9 @@ impl SemanticRuntime {
         max_tokens: usize,
     ) -> TtsResult<SemanticCodes> {
         if text.trim().is_empty() {
-            return Err(indextts_core::IndexTtsError::InvalidText("text is empty".into()));
+            return Err(indextts_core::IndexTtsError::InvalidText(
+                "text is empty".into(),
+            ));
         }
         let reference = self.reference.encode(reference_audio)?;
         self.generate_with_reference(text, language, &reference, max_tokens)
@@ -182,29 +183,35 @@ impl SemanticRuntime {
         max_tokens: usize,
     ) -> TtsResult<SemanticCodes> {
         if text.trim().is_empty() {
-            return Err(indextts_core::IndexTtsError::InvalidText("text is empty".into()));
+            return Err(indextts_core::IndexTtsError::InvalidText(
+                "text is empty".into(),
+            ));
         }
         let normalized = self.normalizer.normalize(text, language)?;
         let tokens = self.tokenizer.tokenize_for_gpt(&normalized, language)?;
         let conditioning = ort_f32_to_candle(&reference.gpt_conditioning, self.gpt.device())?;
-        let prefix = self.gpt.build_prefix(&conditioning, &tokens, language_token_id(language))
+        let prefix = self
+            .gpt
+            .build_prefix(&conditioning, &tokens, language_token_id(language))
             .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
         let dummy_text = CandleTensor::zeros((1, 0), candle_core::DType::U32, self.gpt.device())
             .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
-        let (input_ids, attention_mask) = self.gpt.prepare_inputs(&prefix, &dummy_text, None)
+        let (input_ids, attention_mask) = self
+            .gpt
+            .prepare_inputs(&prefix, &dummy_text, None)
             .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
-        let input_len = input_ids.dim(1)
+        let input_len = input_ids
+            .dim(1)
             .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
-        let mut generator = GreedyGenerator::new(
-            self.gpt.device(),
-            input_len + max_tokens + 1,
-        );
-        let output = generator.generate(
-            &self.gpt,
-            &input_ids,
-            Some(&attention_mask),
-            input_len + max_tokens - 1,
-        ).map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+        let mut generator = GreedyGenerator::new(self.gpt.device(), input_len + max_tokens + 1);
+        let output = generator
+            .generate(
+                &self.gpt,
+                &input_ids,
+                Some(&attention_mask),
+                input_len + max_tokens - 1,
+            )
+            .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
         if output.tokens.is_empty() {
             return Err(indextts_core::IndexTtsError::EmptySemanticCodes);
         }
@@ -226,11 +233,8 @@ impl SemanticRuntime {
         let decoded = run_semantic_codec(&self.semantic_codec, &codes.tokens)?;
         let decoded_frames = decoded.shape()[1] as usize;
         let generated_frames = (decoded_frames as f32 * 1.72 * duration_factor) as usize;
-        let generated_condition = run_length_regulator(
-            &self.length_regulator,
-            decoded,
-            generated_frames,
-        )?;
+        let generated_condition =
+            run_length_regulator(&self.length_regulator, decoded, generated_frames)?;
         let condition = concat_conditions(&reference.prompt_condition, &generated_condition)?;
         let full_mel = solve_cfm_bucketed(
             &self.dit_buckets,
@@ -246,7 +250,9 @@ impl SemanticRuntime {
 
     pub fn vocode(&self, mel: &Tensor) -> TtsResult<AudioBuffer> {
         let waveform = self.bigvgan_buckets.synthesize(mel)?;
-        let samples: Vec<f32> = waveform.as_slice().iter()
+        let samples: Vec<f32> = waveform
+            .as_slice()
+            .iter()
             .map(|sample| sample.clamp(-1.0, 1.0))
             .collect();
         if samples.is_empty() || samples.iter().any(|sample| !sample.is_finite()) {
@@ -265,20 +271,26 @@ fn concat_conditions(left: &Tensor, right: &Tensor) -> TtsResult<Tensor> {
         || right.shape() != [1, right_frames as i64, 512]
     {
         return Err(indextts_core::IndexTtsError::BackendFailure(format!(
-            "invalid condition shapes {:?} and {:?}", left.shape(), right.shape()
+            "invalid condition shapes {:?} and {:?}",
+            left.shape(),
+            right.shape()
         )));
     }
     let mut data = Vec::with_capacity((left_frames + right_frames) * 512);
     data.extend_from_slice(left.as_slice());
     data.extend_from_slice(right.as_slice());
-    Ok(Tensor::new(data, vec![1, (left_frames + right_frames) as i64, 512]))
+    Ok(Tensor::new(
+        data,
+        vec![1, (left_frames + right_frames) as i64, 512],
+    ))
 }
 
 fn crop_reference_mel(mel: &Tensor, prompt_frames: usize) -> TtsResult<Tensor> {
     let total_frames = mel.shape()[2] as usize;
     if mel.shape()[..2] != [1, 80] || prompt_frames >= total_frames {
         return Err(indextts_core::IndexTtsError::BackendFailure(format!(
-            "cannot crop mel {:?} at frame {prompt_frames}", mel.shape()
+            "cannot crop mel {:?} at frame {prompt_frames}",
+            mel.shape()
         )));
     }
     let generated_frames = total_frames - prompt_frames;
@@ -290,9 +302,12 @@ fn crop_reference_mel(mel: &Tensor, prompt_frames: usize) -> TtsResult<Tensor> {
     Ok(Tensor::new(data, vec![1, 80, generated_frames as i64]))
 }
 
-
 fn ort_f32_to_candle(tensor: &Tensor, device: &Device) -> TtsResult<CandleTensor> {
-    let shape: Vec<usize> = tensor.shape().iter().map(|dimension| *dimension as usize).collect();
+    let shape: Vec<usize> = tensor
+        .shape()
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .collect();
     CandleTensor::from_slice(tensor.as_slice(), shape, device)
         .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))
 }
@@ -307,13 +322,19 @@ pub struct IndexTtsPipeline {
 impl IndexTtsPipeline {
     /// Create a new pipeline
     pub fn new(config: ModelConfig) -> Self {
-        Self { config, runtime: None }
+        Self {
+            config,
+            runtime: None,
+        }
     }
 
     /// Load all runtime models.
     #[instrument(skip(self))]
     pub fn load(&mut self) -> TtsResult<()> {
-        info!("Loading IndexTTS-2.5 models from {:?}", self.config.model_dir);
+        info!(
+            "Loading IndexTTS-2.5 models from {:?}",
+            self.config.model_dir
+        );
         self.runtime = Some(Mutex::new(SemanticRuntime::load(&self.config.model_dir)?));
         info!("Model loading complete");
         Ok(())
@@ -336,15 +357,19 @@ impl IndexTtsPipeline {
             indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
         })?;
         let mut runtime = runtime.lock().map_err(|_| {
-            indextts_core::IndexTtsError::BackendFailure("pipeline runtime lock was poisoned".into())
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
         })?;
         let reference = runtime.reference.encode(reference_audio_path)?;
         let max_tokens = gen_config.max_length.unwrap_or(1815);
-        let codes = runtime.generate_with_reference(
-            text, gen_config.language, &reference, max_tokens,
-        )?;
+        let codes =
+            runtime.generate_with_reference(text, gen_config.language, &reference, max_tokens)?;
         let mel = runtime.generate_mel(
-            &codes, &reference, gen_config.duration_factor, gen_config.seed,
+            &codes,
+            &reference,
+            gen_config.duration_factor,
+            gen_config.seed,
         )?;
         runtime.vocode(&mel)
     }
@@ -372,7 +397,7 @@ pub fn synthesize(
         device: DeviceConfig::default(),
         precision: indextts_core::Precision::default(),
     };
-    
+
     let mut pipeline = IndexTtsPipeline::new(model_config);
     pipeline.load()?;
     pipeline.synthesize(text, reference_audio, config)
@@ -381,7 +406,7 @@ pub fn synthesize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indextts_core::{ModelConfig, DeviceConfig, GenerationConfig};
+    use indextts_core::ModelConfig;
 
     #[test]
     fn test_pipeline_creation() {

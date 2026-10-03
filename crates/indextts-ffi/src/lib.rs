@@ -1,102 +1,60 @@
-//! C ABI for IndexTTS-2.5
-//!
-//! Provides stable C API for use by Go, C/C++, and other languages.
-//!
-//! # Safety
-//!
-//! All FFI functions are unsafe and require proper handling of pointers.
+//! Stable C ABI for IndexTTS-2.5.
 
-use indextts_core::{
-    AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, IndexTtsError,
-    Language, ModelConfig, Precision, Result as TtsResult, SemanticCodes,
-};
+#![allow(non_camel_case_types)]
+
+use indextts_audio::process_reference_audio;
+use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};
 use indextts_pipeline::IndexTtsPipeline;
+use once_cell::sync::Lazy;
 use std::ffi::{CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Opaque handle to an IndexTTS model
-pub type indextts_model_t = *mut IndexTtsModelHandle;
-
-/// Opaque handle to a voice (preprocessed speaker condition)
-pub type indextts_voice_t = *mut IndexTtsVoiceHandle;
-
-/// Opaque handle to generated audio
-pub type indextts_audio_t = *mut IndexTtsAudioHandle;
-
-/// Internal model handle
-struct IndexTtsModelHandle {
+pub struct IndexTtsModelHandle {
     pipeline: IndexTtsPipeline,
 }
-
-/// Internal voice handle
-struct IndexTtsVoiceHandle {
+pub struct IndexTtsVoiceHandle {
     reference_path: PathBuf,
-    // Precomputed conditions would go here
 }
+pub type indextts_model_t = *mut IndexTtsModelHandle;
+pub type indextts_voice_t = *mut IndexTtsVoiceHandle;
 
-/// Internal audio handle
-struct IndexTtsAudioHandle {
-    audio: AudioBuffer,
-}
-
-// ============================================================================
-// Model Options
-// ============================================================================
-
-/// Model loading options
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct indextts_model_options_t {
-    /// Model directory path (UTF-8)
     pub model_dir: *const libc::c_char,
-    /// CUDA device index
-    pub device_index: libc::int32_t,
-    /// Precision: 0=float32, 1=bfloat16
-    pub precision: libc::int32_t,
-    /// Reserved for future use
-    pub reserved: [libc::uint64_t; 8],
+    /// -1 = CPU, 0 or greater = CUDA device. CUDA is rejected until built in.
+    pub device_index: i32,
+    pub precision: i32,
+    pub reserved: [u64; 8],
 }
-
 impl Default for indextts_model_options_t {
     fn default() -> Self {
         Self {
             model_dir: std::ptr::null(),
-            device_index: 0,
+            device_index: -1,
             precision: 0,
             reserved: [0; 8],
         }
     }
 }
 
-/// Generation options
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct indextts_generate_options_t {
-    /// Text to synthesize (UTF-8)
     pub text: *const libc::c_char,
-    /// Language code (ZH, EN, JA, ES, AR)
     pub language: *const libc::c_char,
-    /// Random seed (0 = random)
-    pub seed: libc::uint64_t,
-    /// Duration factor (1.0 = default)
-    pub duration_factor: libc::c_float,
-    /// Do sample (0 = greedy, 1 = sample)
-    pub do_sample: libc::int32_t,
-    /// Number of beams
-    pub num_beams: libc::int32_t,
-    /// Temperature for sampling
-    pub temperature: libc::c_float,
-    /// Top-k for sampling
-    pub top_k: libc::int32_t,
-    /// Top-p for sampling
-    pub top_p: libc::c_float,
-    /// Repetition penalty
-    pub repetition_penalty: libc::c_float,
-    /// Reserved
-    pub reserved: [libc::uint64_t; 4],
+    pub seed: u64,
+    pub duration_factor: f32,
+    pub do_sample: i32,
+    pub num_beams: i32,
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub reserved: [u64; 4],
 }
-
 impl Default for indextts_generate_options_t {
     fn default() -> Self {
         Self {
@@ -115,340 +73,305 @@ impl Default for indextts_generate_options_t {
     }
 }
 
-/// Audio output structure
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct indextts_audio_out_t {
-    /// Audio samples (normalized to [-1, 1])
-    pub samples: *mut libc::c_float,
-    /// Number of samples
-    pub sample_count: libc::size_t,
-    /// Sample rate in Hz
-    pub sample_rate: libc::uint32_t,
-    /// Number of channels
-    pub channels: libc::uint32_t,
-    /// Reserved
-    pub reserved: [libc::uint64_t; 4],
+    pub samples: *mut f32,
+    pub sample_count: usize,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub reserved: [u64; 4],
 }
-
 impl Default for indextts_audio_out_t {
     fn default() -> Self {
         Self {
             samples: std::ptr::null_mut(),
             sample_count: 0,
-            sample_rate: 22050,
-            channels: 1,
+            sample_rate: 0,
+            channels: 0,
             reserved: [0; 4],
         }
     }
 }
 
-// ============================================================================
-// Error Handling
-// ============================================================================
+static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
+static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
-/// Last error message (thread-local)
-thread_local! {
-    static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
+fn set_last_error(message: impl AsRef<str>) {
+    let sanitized = message.as_ref().replace('\0', "\\0");
+    if let Ok(mut error) = LAST_ERROR.lock() {
+        *error = CString::new(sanitized).ok();
+    }
+}
+fn clear_last_error() {
+    if let Ok(mut error) = LAST_ERROR.lock() {
+        *error = None;
+    }
+}
+fn ffi_status(operation: impl FnOnce() -> Result<(), String>) -> i32 {
+    clear_last_error();
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            set_last_error(error);
+            -1
+        }
+        Err(_) => {
+            set_last_error("panic contained at IndexTTS C ABI boundary");
+            -2
+        }
+    }
+}
+fn ffi_void(operation: impl FnOnce()) {
+    if catch_unwind(AssertUnwindSafe(operation)).is_err() {
+        set_last_error("panic contained at IndexTTS C ABI boundary");
+    }
+}
+unsafe fn required_utf8<'a>(pointer: *const libc::c_char, name: &str) -> Result<&'a str, String> {
+    if pointer.is_null() {
+        return Err(format!("{name} is required"));
+    }
+    CStr::from_ptr(pointer)
+        .to_str()
+        .map_err(|_| format!("{name} is not valid UTF-8"))
+}
+fn validate_reserved(values: &[u64]) -> Result<(), String> {
+    if values.iter().any(|value| *value != 0) {
+        Err("reserved fields must be zero".into())
+    } else {
+        Ok(())
+    }
 }
 
-/// Set the last error message
-fn set_last_error(msg: &str) {
-    LAST_ERROR.with(|e| {
-        let mut guard = e.lock().unwrap();
-        *guard = CString::new(msg).ok();
+#[no_mangle]
+pub unsafe extern "C" fn indextts_model_options_init(options: *mut indextts_model_options_t) {
+    ffi_void(|| {
+        if !options.is_null() {
+            *options = indextts_model_options_t::default();
+        }
+    });
+}
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate_options_init(options: *mut indextts_generate_options_t) {
+    ffi_void(|| {
+        if !options.is_null() {
+            *options = indextts_generate_options_t::default();
+        }
     });
 }
 
-/// Get the last error message
-fn get_last_error() -> Option<CString> {
-    LAST_ERROR.with(|e| {
-        let guard = e.lock().unwrap();
-        guard.clone()
-    })
-}
-
-// ============================================================================
-// FFI Functions
-// ============================================================================
-
-/// Load an IndexTTS model
-///
-/// # Safety
-/// - `options` must be a valid pointer
-/// - `out_model` must point to valid memory
 #[no_mangle]
 pub unsafe extern "C" fn indextts_model_load(
     options: *const indextts_model_options_t,
     out_model: *mut indextts_model_t,
-) -> libc::int32_t {
-    // Validate inputs
-    if options.is_null() || out_model.is_null() {
-        set_last_error("Invalid arguments");
-        return -1;
-    }
-
-    let options = &*options;
-
-    // Get model directory
-    if options.model_dir.is_null() {
-        set_last_error("model_dir is required");
-        return -1;
-    }
-
-    let model_dir = unsafe {
-        match CStr::from_ptr(options.model_dir).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_last_error("Invalid model_dir encoding");
-                return -1;
+) -> i32 {
+    ffi_status(|| {
+        if options.is_null() || out_model.is_null() {
+            return Err("invalid arguments".into());
+        }
+        *out_model = std::ptr::null_mut();
+        let options = &*options;
+        validate_reserved(&options.reserved)?;
+        let model_dir = required_utf8(options.model_dir, "model_dir")?;
+        if options.device_index != -1 {
+            return Err("this build supports CPU only; device_index must be -1".into());
+        }
+        let precision = match options.precision {
+            0 => Precision::Float32,
+            value => {
+                return Err(format!(
+                    "unsupported precision {value}; this build requires float32"
+                ))
             }
-        }
-    };
-
-    // Create config
-    let device = match options.device_index {
-        0 => DeviceConfig::new(DeviceKind::Auto, 0),
-        _ => DeviceConfig::new(DeviceKind::Cuda, options.device_index as usize),
-    };
-
-    let precision = match options.precision {
-        0 => Precision::Float32,
-        1 => Precision::BFloat16,
-        _ => {
-            set_last_error("Invalid precision");
-            return -1;
-        }
-    };
-
-    let config = ModelConfig {
-        model_dir: PathBuf::from(model_dir),
-        device,
-        precision,
-    };
-
-    // Create and load pipeline
-    let mut pipeline = IndexTtsPipeline::new(config);
-    match pipeline.load() {
-        Ok(_) => {
-            let handle = Box::new(IndexTtsModelHandle { pipeline });
-            unsafe { *out_model = Box::into_raw(handle) };
-            0
-        }
-        Err(e) => {
-            set_last_error(&e.to_string());
-            -1
-        }
-    }
+        };
+        let config = ModelConfig {
+            model_dir: PathBuf::from(model_dir),
+            device: DeviceConfig::new(DeviceKind::Cpu, 0),
+            precision,
+        };
+        let mut pipeline = IndexTtsPipeline::new(config);
+        pipeline.load().map_err(|error| error.to_string())?;
+        *out_model = Box::into_raw(Box::new(IndexTtsModelHandle { pipeline }));
+        Ok(())
+    })
 }
 
-/// Prepare a voice from reference audio
-///
-/// # Safety
-/// - `model` must be a valid model handle
-/// - `reference_audio_path` must be valid UTF-8 string
-/// - `out_voice` must point to valid memory
 #[no_mangle]
 pub unsafe extern "C" fn indextts_voice_prepare(
     model: indextts_model_t,
     reference_audio_path: *const libc::c_char,
     out_voice: *mut indextts_voice_t,
-) -> libc::int32_t {
-    if model.is_null() || reference_audio_path.is_null() || out_voice.is_null() {
-        set_last_error("Invalid arguments");
-        return -1;
-    }
-
-    let path = unsafe {
-        match CStr::from_ptr(reference_audio_path).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_last_error("Invalid path encoding");
-                return -1;
-            }
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || out_voice.is_null() {
+            return Err("invalid arguments".into());
         }
-    };
-
-    let handle = unsafe { &*model };
-    let voice = IndexTtsVoiceHandle {
-        reference_path: PathBuf::from(path),
-    };
-
-    let voice_box = Box::new(voice);
-    unsafe { *out_voice = Box::into_raw(voice_box) };
-    0
+        *out_voice = std::ptr::null_mut();
+        let path = PathBuf::from(required_utf8(reference_audio_path, "reference_audio_path")?);
+        process_reference_audio(&path).map_err(|error| error.to_string())?;
+        *out_voice = Box::into_raw(Box::new(IndexTtsVoiceHandle {
+            reference_path: path,
+        }));
+        Ok(())
+    })
 }
 
-/// Generate speech
-///
-/// # Safety
-/// - All pointer arguments must be valid
-/// - Returned audio must be freed with indextts_audio_free
 #[no_mangle]
 pub unsafe extern "C" fn indextts_generate(
     model: indextts_model_t,
     voice: indextts_voice_t,
     options: *const indextts_generate_options_t,
     out_audio: *mut indextts_audio_out_t,
-) -> libc::int32_t {
-    if model.is_null() || voice.is_null() || options.is_null() || out_audio.is_null() {
-        set_last_error("Invalid arguments");
-        return -1;
-    }
-
-    let options = &*options;
-
-    // Parse text
-    let text = unsafe {
-        if options.text.is_null() {
-            set_last_error("text is required");
-            return -1;
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || voice.is_null() || options.is_null() || out_audio.is_null() {
+            return Err("invalid arguments".into());
         }
-        match CStr::from_ptr(options.text).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_last_error("Invalid text encoding");
-                return -1;
-            }
-        }
-    };
-
-    // Parse language
-    let language = unsafe {
-        if options.language.is_null() {
+        *out_audio = indextts_audio_out_t::default();
+        let options = &*options;
+        validate_reserved(&options.reserved)?;
+        let text = required_utf8(options.text, "text")?;
+        let language = if options.language.is_null() {
             "ZH"
         } else {
-            match CStr::from_ptr(options.language).to_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    set_last_error("Invalid language encoding");
-                    return -1;
-                }
-            }
+            required_utf8(options.language, "language")?
+        };
+        let language =
+            Language::parse(language).ok_or_else(|| format!("unsupported language {language}"))?;
+        if options.do_sample != 0 || options.num_beams != 1 {
+            return Err("this build supports greedy generation only".into());
         }
-    };
-
-    let lang = Language::parse(language).unwrap_or(Language::Zh);
-
-    // Create generation config
-    let gen_config = GenerationConfig {
-        text: text.to_string(),
-        language: lang,
-        seed: options.seed,
-        duration_factor: options.duration_factor,
-        do_sample: options.do_sample != 0,
-        num_beams: options.num_beams as usize,
-        temperature: options.temperature,
-        top_k: options.top_k as usize,
-        top_p: options.top_p,
-        repetition_penalty: options.repetition_penalty,
-        max_length: None,
-    };
-
-    let model_handle = unsafe { &*model };
-    let voice_handle = unsafe { &*voice };
-
-    match model_handle.pipeline.synthesize(
-        text,
-        &voice_handle.reference_path,
-        &gen_config,
-    ) {
-        Ok(audio) => {
-            let samples = audio.samples.clone();
-            let sample_rate = audio.sample_rate;
-            
-            // Allocate output
-            let out = indextts_audio_out_t {
-                samples: samples.as_ptr() as *mut libc::c_float,
-                sample_count: samples.len(),
-                sample_rate,
-                channels: 1,
-                reserved: [0; 4],
-            };
-            
-            // Store audio for later cleanup
-            let audio_handle = Box::new(IndexTtsAudioHandle { audio });
-            // TODO: Store this somewhere for cleanup
-            
-            unsafe { *out_audio = out };
-            0
+        if !(0.5..=2.0).contains(&options.duration_factor) || !options.duration_factor.is_finite() {
+            return Err("duration_factor must be finite and in [0.5, 2.0]".into());
         }
-        Err(e) => {
-            set_last_error(&e.to_string());
-            -1
+        if !options.temperature.is_finite()
+            || !options.top_p.is_finite()
+            || !options.repetition_penalty.is_finite()
+            || options.top_k < 0
+        {
+            return Err("invalid generation option".into());
         }
-    }
+        let config = GenerationConfig {
+            text: text.into(),
+            language,
+            seed: options.seed,
+            duration_factor: options.duration_factor,
+            do_sample: false,
+            num_beams: 1,
+            temperature: options.temperature,
+            top_k: options.top_k as usize,
+            top_p: options.top_p,
+            repetition_penalty: options.repetition_penalty,
+            max_length: None,
+        };
+        let audio = (&*model)
+            .pipeline
+            .synthesize(text, &(&*voice).reference_path, &config)
+            .map_err(|error| error.to_string())?;
+        let mut samples = audio.samples.into_boxed_slice();
+        let output = indextts_audio_out_t {
+            samples: samples.as_mut_ptr(),
+            sample_count: samples.len(),
+            sample_rate: audio.sample_rate,
+            channels: audio.channels as u32,
+            reserved: [0; 4],
+        };
+        std::mem::forget(samples);
+        *out_audio = output;
+        Ok(())
+    })
 }
 
-/// Free audio data
-///
-/// # Safety
-/// - `audio` must be a valid audio out pointer
 #[no_mangle]
 pub unsafe extern "C" fn indextts_audio_free(audio: *mut indextts_audio_out_t) {
-    if !audio.is_null() {
-        // Audio samples were owned by IndexTtsAudioHandle
-        // This needs proper memory management
-    }
+    ffi_void(|| {
+        if audio.is_null() {
+            return;
+        }
+        let output = &mut *audio;
+        if !output.samples.is_null() {
+            drop(Vec::from_raw_parts(
+                output.samples,
+                output.sample_count,
+                output.sample_count,
+            ));
+        }
+        *output = indextts_audio_out_t::default();
+    });
 }
-
-/// Free voice handle
-///
-/// # Safety
-/// - `voice` must be a valid voice handle
 #[no_mangle]
 pub unsafe extern "C" fn indextts_voice_free(voice: indextts_voice_t) {
-    if !voice.is_null() {
-        unsafe { drop(Box::from_raw(voice)) };
-    }
+    ffi_void(|| {
+        if !voice.is_null() {
+            drop(Box::from_raw(voice));
+        }
+    });
 }
-
-/// Free model handle
-///
-/// # Safety
-/// - `model` must be a valid model handle
 #[no_mangle]
 pub unsafe extern "C" fn indextts_model_free(model: indextts_model_t) {
-    if !model.is_null() {
-        unsafe { drop(Box::from_raw(model)) };
-    }
+    ffi_void(|| {
+        if !model.is_null() {
+            drop(Box::from_raw(model));
+        }
+    });
 }
-
-/// Get the last error message
-///
-/// Returns null if no error occurred
 #[no_mangle]
-pub unsafe extern "C" fn indextts_last_error() -> *const libc::c_char {
-    match get_last_error() {
-        Some(cstr) => cstr.as_ptr(),
-        None => std::ptr::null(),
-    }
+pub extern "C" fn indextts_last_error() -> *const libc::c_char {
+    LAST_ERROR
+        .lock()
+        .ok()
+        .and_then(|error| error.as_ref().map(|value| value.as_ptr()))
+        .unwrap_or(std::ptr::null())
 }
-
-/// Get the library version
 #[no_mangle]
 pub extern "C" fn indextts_version() -> *const libc::c_char {
-    CString::new(env!("CARGO_PKG_VERSION")).unwrap().as_ptr()
+    VERSION.as_ptr().cast()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_default_options() {
-        let opts = indextts_model_options_t::default();
-        assert!(opts.model_dir.is_null());
-        assert_eq!(opts.device_index, 0);
-        assert_eq!(opts.precision, 0);
+    fn defaults_are_valid() {
+        let model = indextts_model_options_t::default();
+        assert_eq!(model.device_index, -1);
+        let generation = indextts_generate_options_t::default();
+        assert_eq!(generation.num_beams, 1);
+        assert_eq!(generation.duration_factor, 1.0);
     }
-
     #[test]
-    fn test_default_gen_options() {
-        let opts = indextts_generate_options_t::default();
-        assert!(opts.text.is_null());
-        assert_eq!(opts.seed, 0);
-        assert_eq!(opts.duration_factor, 1.0);
-        assert_eq!(opts.num_beams, 1);
+    fn version_and_error_pointers_are_stable() {
+        assert_eq!(
+            unsafe { CStr::from_ptr(indextts_version()) }
+                .to_str()
+                .unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+        set_last_error("example");
+        let pointer = indextts_last_error();
+        assert_eq!(
+            unsafe { CStr::from_ptr(pointer) }.to_str().unwrap(),
+            "example"
+        );
+    }
+    #[test]
+    fn audio_free_reclaims_and_zeros() {
+        let mut samples = vec![1.0f32, 2.0].into_boxed_slice();
+        let mut audio = indextts_audio_out_t {
+            samples: samples.as_mut_ptr(),
+            sample_count: 2,
+            sample_rate: 22_050,
+            channels: 1,
+            reserved: [0; 4],
+        };
+        std::mem::forget(samples);
+        unsafe {
+            indextts_audio_free(&mut audio);
+        }
+        assert!(audio.samples.is_null());
+        assert_eq!(audio.sample_count, 0);
+        unsafe {
+            indextts_audio_free(&mut audio);
+        }
     }
 }

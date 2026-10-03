@@ -95,14 +95,35 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Windows CI for CUDA/FFI support
   windows:
-    name: Windows Build
+    name: Windows CPU and FFI Build
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --workspace --features cuda
+      - name: Build release CLI
+        run: cargo build --release -p indextts-cli
+      - name: Build release C ABI
+        run: cargo build --release -p indextts-ffi
       - name: Run tests
         run: cargo test --workspace
+      - name: Verify DLL artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/release/indextts.dll)) { throw "missing indextts.dll" }
+
+  go:
+    name: Go binding
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+      - run: cargo build --release -p indextts-ffi
+      - name: Compile Go binding
+        shell: pwsh
+        run: |
+          $env:CGO_LDFLAGS="-L$pwd/target/release -lindextts"
+          go -C bindings/go test ./...
