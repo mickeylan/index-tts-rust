@@ -1,6 +1,6 @@
 # Windows PowerShell 使用手册
 
-本文给出从源码构建、模型导出、CPU/GPU 合成、测试和 CUDA 发布包制作的完整 PowerShell 命令。以下路径按当前已验证环境编写，请按实际安装位置修改。
+本文给出从源码构建、模型导出、CPU/GPU 合成、测试和 CUDA 发布包制作的完整操作流程。需要了解每条 PowerShell 命令和每个参数的详细含义，请同时阅读 [Windows PowerShell 命令详解](WINDOWS_POWERSHELL_COMMAND_REFERENCE.md)。以下路径按当前已验证环境编写，请按实际安装位置修改。
 
 ## 1. 已验证环境
 
