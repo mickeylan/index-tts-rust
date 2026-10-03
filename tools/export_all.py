@@ -10,7 +10,11 @@ import sys
 from pathlib import Path
 
 COMPONENTS = ("campplus", "wav2vec2bert", "gpt-conditioning", "semantic-codec", "length-regulator")
-TOKENIZER_FILES = ("bpe.model", "multilingual_zh_ja_yue_char_del.tiktoken")
+TOKENIZER_FILES = (
+    "bpe.model",
+    "multilingual_zh_ja_yue_char_del.tiktoken",
+    "pinyin.vocab",
+)
 
 
 def run(*args: object) -> None:

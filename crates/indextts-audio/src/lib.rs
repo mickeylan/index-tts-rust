@@ -80,7 +80,12 @@ fn read_wav(path: &Path) -> Result<AudioBuffer> {
                     })
                     .collect()
             }
-            32 => {
+            24 | 32 => {
+                let scale = if spec.bits_per_sample == 24 {
+                    8_388_608.0
+                } else {
+                    2_147_483_648.0
+                };
                 let samples: Vec<i32> = reader
                     .into_samples::<i32>()
                     .filter_map(|s| s.ok())
@@ -88,7 +93,7 @@ fn read_wav(path: &Path) -> Result<AudioBuffer> {
                 samples
                     .chunks(channels)
                     .map(|chunk| {
-                        let sum: f32 = chunk.iter().map(|&s| s as f32 / 2147483648.0).sum();
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / scale).sum();
                         sum / channels as f32
                     })
                     .collect()
