@@ -112,7 +112,7 @@ Set-Content -LiteralPath (Join-Path $outputPath "indextts-cuda.cmd") -Value $lau
 $manifest = [ordered]@{
     package = "index-tts-rust-win64-cuda"
     architecture = "x86_64-pc-windows-msvc"
-    abi_version = "1.4"
+    abi_version = "1.5"
     backend = "cuda"
     cuda = "12.8"
     cudnn = "9"

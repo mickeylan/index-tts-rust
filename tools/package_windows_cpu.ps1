@@ -46,7 +46,7 @@ Copy-Item (Join-Path $repo "tools\verify-runtime.ps1") $outputPath
 $manifest = [ordered]@{
     package = "index-tts-rust-win64-cpu"
     architecture = "x86_64-pc-windows-msvc"
-    abi_version = "1.4"
+    abi_version = "1.5"
     backend = "cpu"
     files = @{}
 }
