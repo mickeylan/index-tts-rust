@@ -20,6 +20,7 @@
 use candle_core::{Device, IndexOp, Result as CandleResult, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache::KvCache;
 use super::model::IndexGpt;
@@ -88,6 +89,51 @@ impl GreedyGenerator {
     /// Get a reference to the KV cache
     pub fn kv_cache(&self) -> Option<&KvCache> {
         self.kv_cache.as_ref()
+    }
+
+    pub fn generate_cancellable(
+        &mut self,
+        model: &IndexGpt,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+        max_length: usize,
+        cancelled: &AtomicBool,
+    ) -> CandleResult<GenerationOutput> {
+        let config = model.config();
+        let device = model.device();
+        let stop_token = config.stop_mel_token;
+        if cancelled.load(Ordering::Acquire) {
+            candle_core::bail!("generation cancelled")
+        }
+        let mut logits = model.prefill(input_ids, attention_mask, None, self.kv_cache.as_mut())?;
+        let mut tokens = Vec::new();
+        let seq_len = input_ids.dim(1)?;
+        let mut current_pos = seq_len;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                candle_core::bail!("generation cancelled")
+            }
+            let last_logits = logits.i((0, logits.dim(1)? - 1))?;
+            let probs_vec = last_logits.to_vec1::<f32>()?;
+            let next_token = probs_vec
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            tokens.push(next_token);
+            if next_token == stop_token {
+                tokens.pop();
+                let stop_position = tokens.len();
+                return Ok(GenerationOutput::new(tokens, true, Some(stop_position)));
+            }
+            if current_pos >= max_length {
+                return Ok(GenerationOutput::new(tokens, false, None));
+            }
+            let next_input = Tensor::new(&[next_token as i64], device)?.reshape((1, 1))?;
+            logits = model.decode(&next_input, self.kv_cache.as_mut().unwrap(), current_pos)?;
+            current_pos += 1;
+        }
     }
 }
 

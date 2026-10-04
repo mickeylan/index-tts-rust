@@ -1,9 +1,12 @@
 package indextts
 
 import (
+	"context"
+	"errors"
 	"math"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestVersion(t *testing.T) {
@@ -44,6 +47,30 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("prepare voice: %v", err)
 	}
 	defer voice.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelled := make(chan error, 1)
+	go func() {
+		_, generateErr := model.GenerateContext(
+			ctx,
+			voice,
+			"这是一段用于验证底层协作取消的较长文本，调用方取消以后推理应当尽快停止，而不是继续生成完整音频。",
+			Options{Language: "ZH", Seed: 1234, DurationFactor: 1},
+		)
+		cancelled <- generateErr
+	}()
+	time.Sleep(500 * time.Millisecond)
+	cancelStarted := time.Now()
+	cancel()
+	select {
+	case cancelErr := <-cancelled:
+		t.Logf("cancelled generation in %s", time.Since(cancelStarted))
+		if !errors.Is(cancelErr, context.Canceled) && !errors.Is(cancelErr, ErrCancelled) {
+			t.Fatalf("expected cancellation error, got %v", cancelErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("cancellation did not stop generation within 30 seconds")
+	}
 
 	audio, err := model.Generate(voice, "你好世界，这是一次Go端到端测试。", Options{
 		Language:       "ZH",

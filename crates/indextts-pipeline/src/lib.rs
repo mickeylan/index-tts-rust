@@ -18,14 +18,21 @@ use indextts_core::{
     AudioBuffer, DeviceConfig, GenerationConfig, Language, ModelConfig, Result as TtsResult,
     SemanticCodes,
 };
-use indextts_gpt::{Generator, GptConfig, GreedyGenerator, IndexGpt};
+use indextts_gpt::{GptConfig, GreedyGenerator, IndexGpt};
 use indextts_ort::{
     run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec, run_wav2vec2bert,
-    solve_cfm_bucketed, BigVganBuckets, DitBuckets, OnnxModel, OnnxSession, Tensor, Wav2VecStats,
+    solve_cfm_bucketed_cancellable, BigVganBuckets, DitBuckets, OnnxModel, OnnxSession, Tensor,
+    Wav2VecStats,
 };
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
-use std::{path::Path, sync::Mutex};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
 use tracing::{info, instrument};
 
 /// Features extracted from a user-provided reference voice.
@@ -253,6 +260,21 @@ impl SemanticRuntime {
         reference: &ReferenceConditioning,
         max_tokens: usize,
     ) -> TtsResult<SemanticCodes> {
+        let cancelled = AtomicBool::new(false);
+        self.generate_with_reference_cancellable(text, language, reference, max_tokens, &cancelled)
+    }
+
+    pub fn generate_with_reference_cancellable(
+        &mut self,
+        text: &str,
+        language: Language,
+        reference: &ReferenceConditioning,
+        max_tokens: usize,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<SemanticCodes> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
         if text.trim().is_empty() {
             return Err(indextts_core::IndexTtsError::InvalidText(
                 "text is empty".into(),
@@ -276,13 +298,20 @@ impl SemanticRuntime {
             .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
         let mut generator = GreedyGenerator::new(self.gpt.device(), input_len + max_tokens + 1);
         let output = generator
-            .generate(
+            .generate_cancellable(
                 &self.gpt,
                 &input_ids,
                 Some(&attention_mask),
                 input_len + max_tokens - 1,
+                cancelled,
             )
-            .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))?;
+            .map_err(|error| {
+                if cancelled.load(Ordering::Acquire) {
+                    indextts_core::IndexTtsError::Cancelled
+                } else {
+                    indextts_core::IndexTtsError::BackendFailure(error.to_string())
+                }
+            })?;
         if output.tokens.is_empty() {
             return Err(indextts_core::IndexTtsError::EmptySemanticCodes);
         }
@@ -296,6 +325,21 @@ impl SemanticRuntime {
         duration_factor: f32,
         seed: u64,
     ) -> TtsResult<Tensor> {
+        let cancelled = AtomicBool::new(false);
+        self.generate_mel_cancellable(codes, reference, duration_factor, seed, &cancelled)
+    }
+
+    pub fn generate_mel_cancellable(
+        &self,
+        codes: &SemanticCodes,
+        reference: &ReferenceConditioning,
+        duration_factor: f32,
+        seed: u64,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<Tensor> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
         if !(0.5..=2.0).contains(&duration_factor) {
             return Err(indextts_core::IndexTtsError::BackendFailure(format!(
                 "duration factor {duration_factor} is outside [0.5, 2.0]"
@@ -307,7 +351,7 @@ impl SemanticRuntime {
         let generated_condition =
             run_length_regulator(&self.length_regulator, decoded, generated_frames)?;
         let condition = concat_conditions(&reference.prompt_condition, &generated_condition)?;
-        let full_mel = solve_cfm_bucketed(
+        let full_mel = solve_cfm_bucketed_cancellable(
             &self.dit_buckets,
             &condition,
             &reference.reference_mel,
@@ -315,6 +359,7 @@ impl SemanticRuntime {
             25,
             0.7,
             seed,
+            cancelled,
         )?;
         crop_reference_mel(&full_mel, reference.reference_mel.shape()[2] as usize)
     }
@@ -422,6 +467,20 @@ impl IndexTtsPipeline {
         reference_audio_path: &Path,
         gen_config: &GenerationConfig,
     ) -> TtsResult<AudioBuffer> {
+        let cancelled = AtomicBool::new(false);
+        self.synthesize_cancellable(text, reference_audio_path, gen_config, &cancelled)
+    }
+
+    pub fn synthesize_cancellable(
+        &self,
+        text: &str,
+        reference_audio_path: &Path,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<AudioBuffer> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
         if gen_config.do_sample || gen_config.num_beams != 1 {
             return Err(indextts_core::IndexTtsError::BackendFailure(
                 "the end-to-end runtime currently supports greedy generation only".into(),
@@ -436,15 +495,27 @@ impl IndexTtsPipeline {
             )
         })?;
         let reference = runtime.reference.encode(reference_audio_path)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
         let max_tokens = gen_config.max_length.unwrap_or(1815);
-        let codes =
-            runtime.generate_with_reference(text, gen_config.language, &reference, max_tokens)?;
-        let mel = runtime.generate_mel(
+        let codes = runtime.generate_with_reference_cancellable(
+            text,
+            gen_config.language,
+            &reference,
+            max_tokens,
+            cancelled,
+        )?;
+        let mel = runtime.generate_mel_cancellable(
             &codes,
             &reference,
             gen_config.duration_factor,
             gen_config.seed,
+            cancelled,
         )?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
         runtime.vocode(&mel)
     }
 
@@ -487,6 +558,21 @@ mod tests {
         let config = ModelConfig::default();
         let pipeline = IndexTtsPipeline::new(config);
         assert!(!pipeline.is_loaded());
+    }
+
+    #[test]
+    fn cancellation_preempts_unloaded_pipeline() {
+        let pipeline = IndexTtsPipeline::new(ModelConfig::default());
+        let cancelled = AtomicBool::new(true);
+        let error = pipeline
+            .synthesize_cancellable(
+                "test",
+                Path::new("unused.wav"),
+                &GenerationConfig::default(),
+                &cancelled,
+            )
+            .unwrap_err();
+        assert!(matches!(error, indextts_core::IndexTtsError::Cancelled));
     }
 
     #[test]

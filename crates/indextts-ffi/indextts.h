@@ -55,12 +55,15 @@ typedef struct {
 #define INDEXTTS_OK 0
 #define INDEXTTS_ERROR -1
 #define INDEXTTS_PANIC -2
+#define INDEXTTS_CANCELLED -3
 
 INDEXTTS_API void indextts_model_options_init(indextts_model_options_t *options);
 INDEXTTS_API void indextts_generate_options_init(indextts_generate_options_t *options);
 INDEXTTS_API int32_t indextts_model_load(const indextts_model_options_t *options, indextts_model_t *out_model);
 INDEXTTS_API int32_t indextts_voice_prepare(indextts_model_t model, const char *reference_audio_path, indextts_voice_t *out_voice);
 INDEXTTS_API int32_t indextts_generate(indextts_model_t model, indextts_voice_t voice, const indextts_generate_options_t *options, indextts_audio_out_t *out_audio);
+/* Thread-safe cooperative cancellation; returns immediately. */
+INDEXTTS_API int32_t indextts_model_cancel(indextts_model_t model);
 INDEXTTS_API void indextts_audio_free(indextts_audio_out_t *audio);
 INDEXTTS_API void indextts_voice_free(indextts_voice_t voice);
 INDEXTTS_API void indextts_model_free(indextts_model_t model);

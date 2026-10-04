@@ -473,6 +473,42 @@ num_beams=1
 
 返回的 `Audio.Samples` 已属于 Go，可在 `Generate` 返回后长期使用。
 
+### 协作取消：`GenerateContext` 与 `Cancel`
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+audio, err := model.GenerateContext(ctx, voice, text, options)
+if errors.Is(err, context.DeadlineExceeded) {
+    // 底层推理已收到取消请求并在安全检查点退出。
+}
+```
+
+也可从另一个 goroutine 主动请求取消：
+
+```go
+if err := model.Cancel(); err != nil {
+    log.Printf("cancel failed: %v", err)
+}
+```
+
+C ABI 对应函数：
+
+```c
+int32_t indextts_model_cancel(indextts_model_t model);
+```
+
+取消是协作式而不是强制终止线程：
+
+- GPT 每个 decode token 前检查；
+- pipeline 神经阶段之间检查；
+- CFM 每个 Euler step 前检查；
+- 已经进入的一次 ONNX Runtime/CUDA kernel 不会被中途破坏，而是在该调用返回后的下一个检查点退出；
+- 取消返回 `INDEXTTS_CANCELLED (-3)`；
+- 取消完成后同一个 Model 可以继续执行下一次生成；
+- `Close` 会等待正在执行的生成退出，不能用来代替取消。
+
 ### `Close()`
 
 ```go
@@ -775,7 +811,7 @@ cgo 和 Windows race 支持受 Go 版本/工具链约束；即使 race detector 
 - 服务启动时加载一次 Model，不要每个请求加载。
 - Voice 尽量复用；当前版本仍会在生成时重新编码参考音频。
 - 使用有界队列限制并发和内存峰值。
-- 请求超时不代表原生推理可立即取消；不要因 HTTP 客户端断开就并发释放 Model。
+- 将请求 context 传给 `GenerateContext`；超时会触发底层协作取消，但当前 ONNX 调用会先执行到安全检查点。
 - 优雅关闭顺序：停止接收请求 → 等待推理结束 → 关闭 Voice → 关闭 Model。
 - 记录耗时、文本长度、semantic token 数、输出秒数和错误类别，不记录私密参考音频内容。
 - 模型和 DLL 版本应与发布包固定，启动时记录 `indextts.Version()`。
@@ -802,7 +838,7 @@ type Synthesizer interface {
 - 错误归类；
 - 服务退出。
 
-注意：`context.Context` 目前只能让 Go 调用方停止等待，底层 C ABI 尚无推理取消函数。
+实现应将 `context.Context` 传给 `GenerateContext`，由 C ABI 取消标志停止 GPT/CFM 后续迭代。
 
 ## 22. 快速检查清单
 

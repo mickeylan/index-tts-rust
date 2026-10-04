@@ -11,7 +11,10 @@ use rand_distr::StandardNormal;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 /// Owned host tensor accepted by the runtime wrapper.
@@ -555,6 +558,23 @@ pub fn solve_cfm_bucketed(
     cfg_rate: f32,
     seed: u64,
 ) -> Result<Tensor> {
+    let cancelled = AtomicBool::new(false);
+    solve_cfm_bucketed_cancellable(
+        buckets, condition, prompt_mel, style, steps, cfg_rate, seed, &cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn solve_cfm_bucketed_cancellable(
+    buckets: &DitBuckets,
+    condition: &Tensor,
+    prompt_mel: &Tensor,
+    style: &Tensor,
+    steps: usize,
+    cfg_rate: f32,
+    seed: u64,
+    cancelled: &AtomicBool,
+) -> Result<Tensor> {
     let required_frames = *condition.shape().get(1).ok_or_else(|| {
         IndexTtsError::BackendFailure("CFM condition has no time dimension".into())
     })? as usize;
@@ -569,6 +589,7 @@ pub fn solve_cfm_bucketed(
         cfg_rate,
         seed,
         required_frames,
+        cancelled,
     )?;
     crop_mel_frames(&output, required_frames)
 }
@@ -625,6 +646,7 @@ pub fn solve_cfm(
     let active_frames = *condition.shape().get(1).ok_or_else(|| {
         IndexTtsError::BackendFailure("CFM condition has no time dimension".into())
     })? as usize;
+    let cancelled = AtomicBool::new(false);
     solve_cfm_inner(
         session,
         condition,
@@ -634,6 +656,7 @@ pub fn solve_cfm(
         cfg_rate,
         seed,
         active_frames,
+        &cancelled,
     )
 }
 
@@ -647,6 +670,7 @@ fn solve_cfm_inner(
     cfg_rate: f32,
     seed: u64,
     active_frames: usize,
+    cancelled: &AtomicBool,
 ) -> Result<Tensor> {
     if steps == 0 {
         return Err(IndexTtsError::BackendFailure(
@@ -713,6 +737,9 @@ fn solve_cfm_inner(
     }
     let dt = 1.0 / steps as f32;
     for step in 0..steps {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(IndexTtsError::Cancelled);
+        }
         let mut stacked_x = x.clone();
         stacked_x.extend_from_slice(&x);
         let mut stacked_prompt = prompt.clone();

@@ -9,10 +9,14 @@ use once_cell::sync::Lazy;
 use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 pub struct IndexTtsModelHandle {
     pipeline: IndexTtsPipeline,
+    cancelled: Arc<AtomicBool>,
 }
 pub struct IndexTtsVoiceHandle {
     reference_path: PathBuf,
@@ -113,8 +117,13 @@ fn ffi_status(operation: impl FnOnce() -> Result<(), String>) -> i32 {
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(())) => 0,
         Ok(Err(error)) => {
+            let status = if error == indextts_core::IndexTtsError::Cancelled.to_string() {
+                -3
+            } else {
+                -1
+            };
             set_last_error(error);
-            -1
+            status
         }
         Err(_) => {
             set_last_error("panic contained at IndexTTS C ABI boundary");
@@ -209,7 +218,10 @@ pub unsafe extern "C" fn indextts_model_load(
         };
         let mut pipeline = IndexTtsPipeline::new(config);
         pipeline.load().map_err(|error| error.to_string())?;
-        *out_model = Box::into_raw(Box::new(IndexTtsModelHandle { pipeline }));
+        *out_model = Box::into_raw(Box::new(IndexTtsModelHandle {
+            pipeline,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }));
         Ok(())
     })
 }
@@ -282,9 +294,11 @@ pub unsafe extern "C" fn indextts_generate(
             repetition_penalty: options.repetition_penalty,
             max_length: None,
         };
-        let audio = (&*model)
+        let model = &*model;
+        model.cancelled.store(false, Ordering::Release);
+        let audio = model
             .pipeline
-            .synthesize(text, &(&*voice).reference_path, &config)
+            .synthesize_cancellable(text, &(&*voice).reference_path, &config, &model.cancelled)
             .map_err(|error| error.to_string())?;
         let mut samples = audio.samples.into_boxed_slice();
         let output = indextts_audio_out_t {
@@ -298,6 +312,22 @@ pub unsafe extern "C" fn indextts_generate(
         *out_audio = output;
         Ok(())
     })
+}
+
+/// Request cooperative cancellation of the model's active generation.
+/// Returns immediately; the generation call returns `INDEXTTS_CANCELLED` at
+/// the next token, pipeline stage, or CFM-step cancellation point.
+#[no_mangle]
+pub unsafe extern "C" fn indextts_model_cancel(model: indextts_model_t) -> i32 {
+    if model.is_null() {
+        return -1;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        (&*model).cancelled.store(true, Ordering::Release);
+    })) {
+        Ok(()) => 0,
+        Err(_) => -2,
+    }
 }
 
 #[no_mangle]
@@ -372,6 +402,18 @@ mod tests {
             "example"
         );
     }
+    #[test]
+    fn cancellation_sets_model_flag() {
+        let handle = Box::new(IndexTtsModelHandle {
+            pipeline: IndexTtsPipeline::new(ModelConfig::default()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let pointer = Box::into_raw(handle);
+        assert_eq!(unsafe { indextts_model_cancel(pointer) }, 0);
+        assert!(unsafe { &*pointer }.cancelled.load(Ordering::Acquire));
+        unsafe { indextts_model_free(pointer) };
+    }
+
     #[test]
     fn audio_free_reclaims_and_zeros() {
         let mut samples = vec![1.0f32, 2.0].into_boxed_slice();

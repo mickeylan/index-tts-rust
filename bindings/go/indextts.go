@@ -8,6 +8,7 @@ package indextts
 import "C"
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -15,6 +16,8 @@ import (
 )
 
 var nativeMu sync.Mutex
+
+var ErrCancelled = errors.New("IndexTTS generation cancelled")
 
 func nativeError() error {
 	if p := C.indextts_last_error(); p != nil {
@@ -37,8 +40,9 @@ type LoadOptions struct {
 }
 
 type Model struct {
-	mu sync.Mutex
-	h  C.indextts_model_t
+	life sync.RWMutex
+	call sync.Mutex
+	h    C.indextts_model_t
 }
 
 func Load(modelDir string) (*Model, error) {
@@ -77,8 +81,10 @@ func LoadWithOptions(loadOptions LoadOptions) (*Model, error) {
 }
 
 func (m *Model) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.life.Lock()
+	defer m.life.Unlock()
+	m.call.Lock()
+	defer m.call.Unlock()
 	if m.h != nil {
 		C.indextts_model_free(m.h)
 		m.h = nil
@@ -93,8 +99,10 @@ type Voice struct {
 }
 
 func (m *Model) PrepareVoice(path string) (*Voice, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
 	if m.h == nil {
 		return nil, errors.New("IndexTTS model is closed")
 	}
@@ -137,8 +145,29 @@ type Audio struct {
 }
 
 func (m *Model) Generate(v *Voice, text string, options Options) (Audio, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	return m.GenerateContext(context.Background(), v, text, options)
+}
+
+func (m *Model) Cancel() error {
+	m.life.RLock()
+	defer m.life.RUnlock()
+	if m.h == nil {
+		return errors.New("IndexTTS model is closed")
+	}
+	if C.indextts_model_cancel(m.h) != C.INDEXTTS_OK {
+		return errors.New("IndexTTS cancellation request failed")
+	}
+	return nil
+}
+
+func (m *Model) GenerateContext(ctx context.Context, v *Voice, text string, options Options) (Audio, error) {
+	if ctx == nil {
+		return Audio{}, errors.New("context is nil")
+	}
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
 	if v == nil {
 		return Audio{}, errors.New("model or voice is closed")
 	}
@@ -160,15 +189,38 @@ func (m *Model) Generate(v *Voice, text string, options Options) (Audio, error) 
 	C.indextts_generate_options_init(&config)
 	config.text, config.language = ctext, clang
 	config.seed, config.duration_factor = C.uint64_t(options.Seed), C.float(options.DurationFactor)
+	if err := ctx.Err(); err != nil {
+		return Audio{}, err
+	}
+	cancelWatchDone := make(chan struct{})
+	cancelWatchStopped := make(chan struct{})
+	go func() {
+		defer close(cancelWatchStopped)
+		select {
+		case <-ctx.Done():
+			_ = m.Cancel()
+		case <-cancelWatchDone:
+		}
+	}()
 	var output C.indextts_audio_out_t
 	nativeMu.Lock()
 	status := C.indextts_generate(m.h, v.h, &config, &output)
-	if status != C.INDEXTTS_OK {
-		err := nativeError()
-		nativeMu.Unlock()
-		return Audio{}, err
+	var nativeErr error
+	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
+		nativeErr = nativeError()
 	}
 	nativeMu.Unlock()
+	close(cancelWatchDone)
+	<-cancelWatchStopped
+	if status == C.INDEXTTS_CANCELLED {
+		if err := ctx.Err(); err != nil {
+			return Audio{}, err
+		}
+		return Audio{}, ErrCancelled
+	}
+	if status != C.INDEXTTS_OK {
+		return Audio{}, nativeErr
+	}
 	defer C.indextts_audio_free(&output)
 	count := int(output.sample_count)
 	if count < 0 || C.size_t(count) != output.sample_count {
