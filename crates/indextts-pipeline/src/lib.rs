@@ -20,9 +20,9 @@ use indextts_core::{
 };
 use indextts_gpt::{GptConfig, GreedyGenerator, IndexGpt};
 use indextts_ort::{
-    run_campplus, run_gpt_conditioning, run_length_regulator, run_semantic_codec, run_wav2vec2bert,
-    solve_cfm_bucketed_cancellable, BigVganBuckets, DitBuckets, OnnxModel, OnnxSession, Tensor,
-    Wav2VecStats,
+    run_campplus, run_emotion_conditioner, run_gpt_conditioning, run_length_regulator,
+    run_semantic_codec, run_wav2vec2bert, solve_cfm_bucketed_cancellable, BigVganBuckets,
+    DitBuckets, OnnxModel, OnnxSession, Tensor, Wav2VecStats,
 };
 use indextts_text::TextNormalizer;
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
@@ -44,6 +44,8 @@ pub struct ReferenceConditioning {
     pub speaker_style: Tensor,
     /// Three GPT conditioning tokens `[1, 3, 1280]`.
     pub gpt_conditioning: Tensor,
+    /// Voice-reference emotion embedding `[1, 1280]`, when packaged.
+    pub voice_emotion: Option<Tensor>,
     /// Reference mel `[1, 80, mel_frames]`.
     pub reference_mel: Tensor,
     /// Length-regulated S2Mel prompt `[1, mel_frames, 512]`.
@@ -52,10 +54,16 @@ pub struct ReferenceConditioning {
 
 /// Runtime for the two reference-audio encoder branches.
 #[derive(Debug)]
+pub struct PreparedEmotion {
+    pub embedding: Tensor,
+}
+
+#[derive(Debug)]
 pub struct ReferenceEncoder {
     wav2vec: OnnxSession,
     campplus: OnnxSession,
     gpt_conditioning: OnnxSession,
+    emotion_conditioner: Option<OnnxSession>,
     length_regulator: OnnxSession,
     stats: Wav2VecStats,
 }
@@ -79,6 +87,14 @@ impl ReferenceEncoder {
                 &OnnxModel::GptConditioning.path(model_dir),
                 cuda_device,
             )?,
+            emotion_conditioner: {
+                let path = OnnxModel::EmotionConditioner.path(model_dir);
+                if path.is_file() {
+                    Some(OnnxSession::load_with_device(&path, cuda_device)?)
+                } else {
+                    None
+                }
+            },
             length_regulator: OnnxSession::load_with_device(
                 &OnnxModel::LengthRegulator.path(model_dir),
                 cuda_device,
@@ -111,6 +127,11 @@ impl ReferenceEncoder {
             speaker_style.clone(),
             semantic.clone(),
         )?;
+        let voice_emotion = self
+            .emotion_conditioner
+            .as_ref()
+            .map(|session| run_emotion_conditioner(session, semantic.clone()))
+            .transpose()?;
         let mel = reference_mel(&audio_22k)?;
         let mel_frames = mel.len() / 80;
         let reference_mel = Tensor::new(mel, vec![1, 80, mel_frames as i64]);
@@ -144,9 +165,36 @@ impl ReferenceEncoder {
             semantic,
             speaker_style,
             gpt_conditioning,
+            voice_emotion,
             reference_mel,
             prompt_condition,
         })
+    }
+
+    pub fn encode_emotion(&self, reference_audio: &Path) -> TtsResult<PreparedEmotion> {
+        let session = self.emotion_conditioner.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "model package has no emotion-conditioner component".into(),
+            )
+        })?;
+        let (audio_16k, _) = process_reference_audio(reference_audio)?;
+        let seamless = seamless_m4t_features(&audio_16k)?;
+        let semantic = run_wav2vec2bert(
+            &self.wav2vec,
+            Tensor::new(
+                seamless.input_features,
+                vec![1, seamless.frames as i64, 160],
+            ),
+            Tensor::new_i64(seamless.attention_mask, vec![1, seamless.frames as i64]),
+        )?;
+        let embedding = run_emotion_conditioner(session, self.stats.normalize(semantic)?)?;
+        if embedding.shape() != [1, 1280] {
+            return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+                "invalid emotion embedding shape {:?}",
+                embedding.shape()
+            )));
+        }
+        Ok(PreparedEmotion { embedding })
     }
 }
 
@@ -378,6 +426,36 @@ impl SemanticRuntime {
         }
         Ok(AudioBuffer::new(samples, 22_050))
     }
+}
+
+pub fn apply_emotion_reference(
+    conditioning: &Tensor,
+    voice_emotion: &Tensor,
+    reference_emotion: &Tensor,
+    strength: f32,
+) -> TtsResult<Tensor> {
+    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        return Err(indextts_core::IndexTtsError::BackendFailure(
+            "emotion strength must be finite and in [0, 1]".into(),
+        ));
+    }
+    if conditioning.shape() != [1, 3, 1280]
+        || voice_emotion.shape() != [1, 1280]
+        || reference_emotion.shape() != [1, 1280]
+    {
+        return Err(indextts_core::IndexTtsError::BackendFailure(format!(
+            "invalid emotion conditioning shapes {:?}, {:?}, {:?}",
+            conditioning.shape(),
+            voice_emotion.shape(),
+            reference_emotion.shape()
+        )));
+    }
+    let mut data = conditioning.as_slice().to_vec();
+    for (index, value) in data.iter_mut().take(1280).enumerate() {
+        *value +=
+            strength * (reference_emotion.as_slice()[index] - voice_emotion.as_slice()[index]);
+    }
+    Ok(Tensor::new(data, vec![1, 3, 1280]))
 }
 
 fn concat_conditions(left: &Tensor, right: &Tensor) -> TtsResult<Tensor> {
@@ -621,6 +699,19 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, indextts_core::IndexTtsError::Cancelled));
+    }
+
+    #[test]
+    fn emotion_reference_blends_only_first_token() {
+        let conditioning = Tensor::new(vec![10.0; 3 * 1280], vec![1, 3, 1280]);
+        let voice = Tensor::new(vec![2.0; 1280], vec![1, 1280]);
+        let reference = Tensor::new(vec![6.0; 1280], vec![1, 1280]);
+        let output = apply_emotion_reference(&conditioning, &voice, &reference, 0.5).unwrap();
+        assert!(output.as_slice()[..1280].iter().all(|value| *value == 12.0));
+        assert!(output.as_slice()[1280..].iter().all(|value| *value == 10.0));
+        let unchanged = apply_emotion_reference(&conditioning, &voice, &reference, 0.0).unwrap();
+        assert_eq!(unchanged, conditioning);
+        assert!(apply_emotion_reference(&conditioning, &voice, &reference, f32::NAN).is_err());
     }
 
     #[test]

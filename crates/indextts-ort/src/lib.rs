@@ -398,6 +398,17 @@ pub fn run_campplus(session: &OnnxSession, features: Tensor) -> Result<Tensor> {
         .ok_or_else(|| IndexTtsError::BackendFailure("missing CAMPPlus output".into()))
 }
 
+pub fn run_emotion_conditioner(session: &OnnxSession, semantic_features: Tensor) -> Result<Tensor> {
+    session
+        .run_tensors(
+            vec![("semantic_features", semantic_features)],
+            vec!["emotion".into()],
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| IndexTtsError::BackendFailure("missing emotion output".into()))
+}
+
 pub fn run_gpt_conditioning(
     session: &OnnxSession,
     speaker_style: Tensor,
