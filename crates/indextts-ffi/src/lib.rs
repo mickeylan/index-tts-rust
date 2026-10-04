@@ -4,9 +4,10 @@
 
 use indextts_audio::process_reference_audio;
 use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};
-use indextts_pipeline::IndexTtsPipeline;
+use indextts_pipeline::{IndexTtsPipeline, ReferenceConditioning};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -19,9 +20,10 @@ pub struct IndexTtsModelHandle {
     pipeline: IndexTtsPipeline,
     cancelled: Arc<AtomicBool>,
     info: ModelInfo,
+    voice_cache: Mutex<VoiceCache>,
 }
 pub struct IndexTtsVoiceHandle {
-    reference_path: PathBuf,
+    conditioning: Arc<ReferenceConditioning>,
     info: VoiceInfo,
 }
 
@@ -36,6 +38,33 @@ struct VoiceInfo {
     duration_seconds: f32,
     source_sample_rate: u32,
     source_channels: u32,
+    cache_bytes: u64,
+}
+
+#[derive(Default)]
+struct VoiceCache {
+    entries: HashMap<String, Arc<ReferenceConditioning>>,
+    order: VecDeque<String>,
+}
+
+impl VoiceCache {
+    const MAX_ENTRIES: usize = 16;
+    fn get(&mut self, key: &str) -> Option<Arc<ReferenceConditioning>> {
+        let value = self.entries.get(key)?.clone();
+        self.order.retain(|item| item != key);
+        self.order.push_back(key.to_owned());
+        Some(value)
+    }
+    fn insert(&mut self, key: String, value: Arc<ReferenceConditioning>) {
+        self.entries.insert(key.clone(), value);
+        self.order.retain(|item| item != &key);
+        self.order.push_back(key);
+        while self.entries.len() > Self::MAX_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
 }
 pub type indextts_model_t = *mut IndexTtsModelHandle;
 pub type indextts_voice_t = *mut IndexTtsVoiceHandle;
@@ -261,6 +290,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn conditioning_bytes(conditioning: &ReferenceConditioning) -> u64 {
+    [
+        &conditioning.semantic,
+        &conditioning.speaker_style,
+        &conditioning.gpt_conditioning,
+        &conditioning.reference_mel,
+        &conditioning.prompt_condition,
+    ]
+    .iter()
+    .map(|tensor| std::mem::size_of_val(tensor.as_slice()) as u64)
+    .sum()
+}
+
 fn load_model_info(model_dir: &std::path::Path, device: DeviceConfig) -> ModelInfo {
     let manifest_path = model_dir.join("manifest.json");
     let (model_version, manifest_sha256) = std::fs::read(&manifest_path)
@@ -313,7 +355,7 @@ pub unsafe extern "C" fn indextts_get_capabilities(
             supports_cpu: 1,
             supports_cancellation: 1,
             supports_request_cancellation: 0,
-            supports_voice_cache: 0,
+            supports_voice_cache: 1,
             supports_emotion_text: 0,
             supports_emotion_reference: 0,
             supports_emotion_vector: 0,
@@ -365,7 +407,7 @@ pub unsafe extern "C" fn indextts_voice_get_info(
         output.duration_seconds = voice.info.duration_seconds;
         output.source_sample_rate = voice.info.source_sample_rate;
         output.source_channels = voice.info.source_channels;
-        output.cache_bytes = 0;
+        output.cache_bytes = voice.info.cache_bytes;
         *info = output;
         Ok(())
     })
@@ -443,6 +485,7 @@ pub unsafe extern "C" fn indextts_model_load(
             pipeline,
             cancelled: Arc::new(AtomicBool::new(false)),
             info,
+            voice_cache: Mutex::new(VoiceCache::default()),
         }));
         Ok(())
     })
@@ -464,16 +507,40 @@ pub unsafe extern "C" fn indextts_voice_prepare(
         let reader = hound::WavReader::open(&path).map_err(|error| error.to_string())?;
         let spec = reader.spec();
         let (_, processed) = process_reference_audio(&path).map_err(|error| error.to_string())?;
+        let reference_sha256 = sha256_hex(&bytes);
+        let model = &*model;
+        let conditioning = {
+            let mut cache = model
+                .voice_cache
+                .lock()
+                .map_err(|_| "voice cache lock was poisoned")?;
+            cache.get(&reference_sha256)
+        };
+        let conditioning = match conditioning {
+            Some(value) => value,
+            None => {
+                let value = Arc::new(
+                    model
+                        .pipeline
+                        .prepare_voice(&path)
+                        .map_err(|error| error.to_string())?,
+                );
+                let mut cache = model
+                    .voice_cache
+                    .lock()
+                    .map_err(|_| "voice cache lock was poisoned")?;
+                cache.insert(reference_sha256.clone(), value.clone());
+                value
+            }
+        };
         let info = VoiceInfo {
-            reference_sha256: sha256_hex(&bytes),
+            reference_sha256,
             duration_seconds: processed.duration() as f32,
             source_sample_rate: spec.sample_rate,
             source_channels: spec.channels as u32,
+            cache_bytes: conditioning_bytes(&conditioning),
         };
-        *out_voice = Box::into_raw(Box::new(IndexTtsVoiceHandle {
-            reference_path: path,
-            info,
-        }));
+        *out_voice = Box::into_raw(Box::new(IndexTtsVoiceHandle { conditioning, info }));
         Ok(())
     })
 }
@@ -530,7 +597,12 @@ pub unsafe extern "C" fn indextts_generate(
         model.cancelled.store(false, Ordering::Release);
         let audio = model
             .pipeline
-            .synthesize_cancellable(text, &(&*voice).reference_path, &config, &model.cancelled)
+            .synthesize_prepared_cancellable(
+                text,
+                &(&*voice).conditioning,
+                &config,
+                &model.cancelled,
+            )
             .map_err(|error| error.to_string())?;
         let mut samples = audio.samples.into_boxed_slice();
         let output = indextts_audio_out_t {
@@ -630,7 +702,7 @@ mod tests {
         assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
         assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);
         assert_eq!(capabilities.supports_request_cancellation, 0);
-        assert_eq!(capabilities.supports_voice_cache, 0);
+        assert_eq!(capabilities.supports_voice_cache, 1);
     }
 
     #[test]
@@ -658,6 +730,7 @@ mod tests {
                 manifest_sha256: String::new(),
                 device: "cpu".into(),
             },
+            voice_cache: Mutex::new(VoiceCache::default()),
         });
         let pointer = Box::into_raw(handle);
         assert_eq!(unsafe { indextts_model_cancel(pointer) }, 0);

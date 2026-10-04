@@ -459,6 +459,18 @@ impl IndexTtsPipeline {
         Ok(())
     }
 
+    pub fn prepare_voice(&self, reference_audio_path: &Path) -> TtsResult<ReferenceConditioning> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        runtime.reference.encode(reference_audio_path)
+    }
+
     /// Synthesize speech from text and a reference voice.
     #[instrument(skip(self, reference_audio_path))]
     pub fn synthesize(
@@ -495,6 +507,42 @@ impl IndexTtsPipeline {
             )
         })?;
         let reference = runtime.reference.encode(reference_audio_path)?;
+        Self::synthesize_with_runtime(&mut runtime, text, &reference, gen_config, cancelled)
+    }
+
+    pub fn synthesize_prepared_cancellable(
+        &self,
+        text: &str,
+        reference: &ReferenceConditioning,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<AudioBuffer> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
+        if gen_config.do_sample || gen_config.num_beams != 1 {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "the end-to-end runtime currently supports greedy generation only".into(),
+            ));
+        }
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let mut runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        Self::synthesize_with_runtime(&mut runtime, text, reference, gen_config, cancelled)
+    }
+
+    fn synthesize_with_runtime(
+        runtime: &mut SemanticRuntime,
+        text: &str,
+        reference: &ReferenceConditioning,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<AudioBuffer> {
         if cancelled.load(Ordering::Acquire) {
             return Err(indextts_core::IndexTtsError::Cancelled);
         }
@@ -502,13 +550,13 @@ impl IndexTtsPipeline {
         let codes = runtime.generate_with_reference_cancellable(
             text,
             gen_config.language,
-            &reference,
+            reference,
             max_tokens,
             cancelled,
         )?;
         let mel = runtime.generate_mel_cancellable(
             &codes,
-            &reference,
+            reference,
             gen_config.duration_factor,
             gen_config.seed,
             cancelled,

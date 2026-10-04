@@ -59,7 +59,15 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("invalid model info: %+v", modelInfo)
 	}
 
-	voice, err := model.PrepareVoice(voicePath)
+	voiceBytes, err := os.ReadFile(voicePath)
+	if err != nil {
+		t.Fatalf("read voice fixture: %v", err)
+	}
+	cachedVoicePath := t.TempDir() + `\voice.wav`
+	if err := os.WriteFile(cachedVoicePath, voiceBytes, 0o600); err != nil {
+		t.Fatalf("copy voice fixture: %v", err)
+	}
+	voice, err := model.PrepareVoice(cachedVoicePath)
 	if err != nil {
 		t.Fatalf("prepare voice: %v", err)
 	}
@@ -68,8 +76,12 @@ func TestEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("voice info: %v", err)
 	}
-	if len(voiceInfo.ReferenceSHA256) != 64 || voiceInfo.DurationSeconds <= 0 || voiceInfo.SourceSampleRate == 0 {
+	if len(voiceInfo.ReferenceSHA256) != 64 || voiceInfo.DurationSeconds <= 0 || voiceInfo.SourceSampleRate == 0 || voiceInfo.CacheBytes == 0 {
 		t.Fatalf("invalid voice info: %+v", voiceInfo)
+	}
+
+	if err := os.Remove(cachedVoicePath); err != nil {
+		t.Fatalf("delete prepared voice source: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
