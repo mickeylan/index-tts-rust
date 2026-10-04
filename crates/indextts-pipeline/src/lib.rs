@@ -8,7 +8,6 @@
 //!      -> BigVGAN -> PCM
 //! ```
 //!
-//! **Note**: This is a placeholder implementation.
 
 use candle_core::{Device, Tensor as CandleTensor};
 use indextts_audio::{

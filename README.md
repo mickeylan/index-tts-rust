@@ -8,7 +8,7 @@ Python-free **runtime** for IndexTTS-2.5. Rust owns preprocessing, tokenization,
 - Chinese-first greedy synthesis from text + reference WAV to 22.05 kHz mono WAV
 - Candle GPT with KV cache and exact fixed-fixture semantic-token parity
 - Wav2Vec2-BERT, CAMPPlus, conditioning, semantic codec, length regulator, bucketed DiT and bucketed BigVGAN through ONNX Runtime
-- Rust API, CLI, C ABI, and Go wrapper
+- Rust API, CLI, stable C ABI 1.5, and independently buildable Go module
 - VRAM-bounded fixed frame buckets (DiT: 256/512/1024; BigVGAN: 256/512)
 
 Not yet validated: sampling/beam search, non-Chinese quality, and every possible long-input bucket. CUDA is opt-in at build and runtime.
@@ -105,7 +105,9 @@ audio, err := model.Generate(voice, "你好", indextts.Options{Language: "ZH"})
 
 - CUDA currently targets the CUDA 12 ABI. CUDA 12.8, cuDNN 9, and a CUDA-enabled ONNX Runtime must be discoverable through `PATH`; CPU remains available with `--device cpu`.
 - Inference is greedy only (`do_sample=false`, `num_beams=1`).
-- WAV input is the supported public contract.
+- WAV paths and interleaved float32 PCM are supported reference-audio inputs.
+- Emotion control supports reference audio, explicit 8-value vectors, and pure-Rust CPU Qwen3 emotion text inference.
+- Target-duration control, sampling, and beam search remain explicitly unsupported and are reported as such by capabilities.
 - Output quality must be assessed with appropriately licensed real speech references; synthetic test tones only establish execution and file correctness.
 - The model weights are governed by the upstream Bilibili Model Use License Agreement and are not covered by this repository's Apache-2.0 source license.
 
