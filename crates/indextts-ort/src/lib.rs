@@ -105,6 +105,8 @@ pub struct OnnxSession {
     inner: Arc<Mutex<Session>>,
     input_names: Vec<String>,
     output_names: Vec<String>,
+    input_types: Vec<String>,
+    output_types: Vec<String>,
 }
 
 impl OnnxSession {
@@ -150,11 +152,23 @@ impl OnnxSession {
             .iter()
             .map(|output| output.name().to_owned())
             .collect();
+        let input_types = session
+            .inputs()
+            .iter()
+            .map(|input| format!("{:?}", input.dtype()))
+            .collect();
+        let output_types = session
+            .outputs()
+            .iter()
+            .map(|output| format!("{:?}", output.dtype()))
+            .collect();
         Ok(Self {
             path: path.to_path_buf(),
             inner: Arc::new(Mutex::new(session)),
             input_names,
             output_names,
+            input_types,
+            output_types,
         })
     }
 
@@ -167,11 +181,38 @@ impl OnnxSession {
     pub fn output_names(&self) -> &[String] {
         &self.output_names
     }
+    pub fn input_types(&self) -> &[String] {
+        &self.input_types
+    }
+    pub fn output_types(&self) -> &[String] {
+        &self.output_types
+    }
     pub fn has_input(&self, name: &str) -> bool {
         self.input_names.iter().any(|item| item == name)
     }
     pub fn has_output(&self, name: &str) -> bool {
         self.output_names.iter().any(|item| item == name)
+    }
+
+    pub fn validate_contract(
+        &self,
+        expected_inputs: &[(&str, &str)],
+        expected_outputs: &[(&str, &str)],
+    ) -> Result<()> {
+        validate_outlets(
+            "input",
+            &self.path,
+            &self.input_names,
+            &self.input_types,
+            expected_inputs,
+        )?;
+        validate_outlets(
+            "output",
+            &self.path,
+            &self.output_names,
+            &self.output_types,
+            expected_outputs,
+        )
     }
 
     pub fn run<IT, OT>(&self, inputs: IT, requested_outputs: OT) -> Result<Vec<Tensor>>
@@ -249,6 +290,39 @@ impl OnnxSession {
             outputs,
         )
     }
+}
+
+fn validate_outlets(
+    kind: &str,
+    path: &Path,
+    names: &[String],
+    types: &[String],
+    expected: &[(&str, &str)],
+) -> Result<()> {
+    if names.len() != expected.len() {
+        return Err(IndexTtsError::InvalidModel(format!(
+            "{} has {} {kind}s, expected {}: {names:?}",
+            path.display(),
+            names.len(),
+            expected.len()
+        )));
+    }
+    for (name, type_fragment) in expected {
+        let index = names
+            .iter()
+            .position(|actual| actual == name)
+            .ok_or_else(|| {
+                IndexTtsError::InvalidModel(format!("{} is missing {kind} {name}", path.display()))
+            })?;
+        if !types[index].contains(type_fragment) {
+            return Err(IndexTtsError::InvalidModel(format!(
+                "{} {kind} {name} has incompatible type {}, expected {type_fragment}",
+                path.display(),
+                types[index]
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]

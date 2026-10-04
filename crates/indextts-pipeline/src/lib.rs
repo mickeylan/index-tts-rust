@@ -78,31 +78,48 @@ impl ReferenceEncoder {
     }
 
     fn load_with_device(model_dir: &Path, cuda_device: Option<usize>) -> TtsResult<Self> {
+        let wav2vec =
+            OnnxSession::load_with_device(&OnnxModel::Wav2Vec2Bert.path(model_dir), cuda_device)?;
+        wav2vec.validate_contract(
+            &[("input_features", "Float32"), ("attention_mask", "Int64")],
+            &[("hidden_states_17", "Float32")],
+        )?;
+        let campplus =
+            OnnxSession::load_with_device(&OnnxModel::Campplus.path(model_dir), cuda_device)?;
+        campplus.validate_contract(&[("x", "Float32")], &[("style", "Float32")])?;
+        let gpt_conditioning = OnnxSession::load_with_device(
+            &OnnxModel::GptConditioning.path(model_dir),
+            cuda_device,
+        )?;
+        gpt_conditioning.validate_contract(
+            &[
+                ("speaker_style", "Float32"),
+                ("semantic_features", "Float32"),
+            ],
+            &[("conditioning", "Float32")],
+        )?;
+        let emotion_conditioner = OnnxSession::load_with_device(
+            &OnnxModel::EmotionConditioner.path(model_dir),
+            cuda_device,
+        )?;
+        emotion_conditioner.validate_contract(
+            &[("semantic_features", "Float32")],
+            &[("emotion", "Float32")],
+        )?;
+        let length_regulator = OnnxSession::load_with_device(
+            &OnnxModel::LengthRegulator.path(model_dir),
+            cuda_device,
+        )?;
+        length_regulator.validate_contract(
+            &[("semantic_features", "Float32"), ("target_length", "Int64")],
+            &[("condition", "Float32")],
+        )?;
         Ok(Self {
-            wav2vec: OnnxSession::load_with_device(
-                &OnnxModel::Wav2Vec2Bert.path(model_dir),
-                cuda_device,
-            )?,
-            campplus: OnnxSession::load_with_device(
-                &OnnxModel::Campplus.path(model_dir),
-                cuda_device,
-            )?,
-            gpt_conditioning: OnnxSession::load_with_device(
-                &OnnxModel::GptConditioning.path(model_dir),
-                cuda_device,
-            )?,
-            emotion_conditioner: {
-                let path = OnnxModel::EmotionConditioner.path(model_dir);
-                if path.is_file() {
-                    Some(OnnxSession::load_with_device(&path, cuda_device)?)
-                } else {
-                    None
-                }
-            },
-            length_regulator: OnnxSession::load_with_device(
-                &OnnxModel::LengthRegulator.path(model_dir),
-                cuda_device,
-            )?,
+            wav2vec,
+            campplus,
+            gpt_conditioning,
+            emotion_conditioner: Some(emotion_conditioner),
+            length_regulator,
             stats: Wav2VecStats::load(&model_dir.join("wav2vec2bert_stats.safetensors"))?,
         })
     }
