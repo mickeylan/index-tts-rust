@@ -9,7 +9,7 @@ Python-free **runtime** for IndexTTS-2.5. Rust owns preprocessing, tokenization,
 - Candle GPT with KV cache and exact fixed-fixture semantic-token parity
 - Wav2Vec2-BERT, CAMPPlus, conditioning, semantic codec, length regulator, bucketed DiT and bucketed BigVGAN through ONNX Runtime
 - Rust API, CLI, C ABI, and Go wrapper
-- Fixed frame buckets (default export: 256, 512, 1024, 2048)
+- VRAM-bounded fixed frame buckets (DiT: 256/512/1024; BigVGAN: 256/512)
 
 Not yet validated: sampling/beam search, non-Chinese quality, and every possible long-input bucket. CUDA is opt-in at build and runtime.
 
@@ -34,7 +34,8 @@ python tools/export_all.py `
   --source E:\path\to\index-tts `
   --checkpoints E:\path\to\index-tts\checkpoints `
   --output E:\models\indextts25-rust `
-  --buckets 256 512 1024 2048
+  --dit-buckets 256 512 1024 `
+  --bigvgan-buckets 256 512
 ```
 
 The command exports all runtime models, tokenizer assets, frame buckets, and a SHA-256 package manifest. Model artifacts are intentionally not committed.
@@ -78,7 +79,7 @@ let audio = pipeline.synthesize("你好", PathBuf::from("voice.wav").as_path(), 
 
 The release build produces `indextts.dll`, `indextts.dll.lib`, and `indextts.lib` on Windows. The public header is `crates/indextts-ffi/indextts.h`. Initialize option structures with the supplied init functions, free audio with `indextts_audio_free`, and close voice/model handles exactly once.
 
-The Go module is under `bindings/go`:
+The independently buildable Go module is under `bindings/go`. Its default build is a safe no-DLL stub; native Windows use requires `CGO_ENABLED=1` and the `indextts_native` build tag:
 
 ```go
 model, err := indextts.Load(`E:\models\indextts25-rust`)
@@ -115,8 +116,13 @@ cargo test --workspace
 python -m unittest discover -s tools -p "test_*.py" -v
 cargo build --release -p indextts-cli
 cargo build --release -p indextts-ffi
-$env:CGO_LDFLAGS="-L$pwd/target/release -lindextts"
+$env:CGO_ENABLED="0"
 go -C bindings/go test ./...
+
+# Explicit native build after creating libindextts.dll.a
+$env:CGO_ENABLED="1"
+$env:CGO_LDFLAGS="-L$pwd/target/release"
+go -C bindings/go test -tags indextts_native ./...
 ```
 
 See the [IndexTTS Windows PowerShell workflow](docs/WINDOWS_POWERSHELL.md) for project operations, the [Go integration guide](docs/GO_INTEGRATION.md) for cgo/service integration, and the separate [PowerShell command reference](docs/powershell/README.md) for PowerShell itself.
