@@ -10,6 +10,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+$ffiHeader = Join-Path $repo "crates\indextts-ffi\indextts.h"
+$goHeader = Join-Path $repo "bindings\go\indextts.h"
+if ((Get-FileHash $ffiHeader -Algorithm SHA256).Hash -ne (Get-FileHash $goHeader -Algorithm SHA256).Hash) {
+    throw "Go module header has drifted from the canonical C ABI header"
+}
 $outputPath = [IO.Path]::GetFullPath((Join-Path $repo $Output))
 $cudaBin = Join-Path $CudaRoot "bin"
 $sitePackages = Join-Path $PythonRoot "Lib\site-packages"
@@ -93,6 +98,7 @@ foreach ($file in $requiredFiles) {
 }
 Copy-Item -LiteralPath (Join-Path $repo "LICENSE") -Destination $outputPath
 Copy-Item -LiteralPath (Join-Path $repo "THIRD_PARTY_NOTICES.md") -Destination $outputPath
+Copy-Item -LiteralPath (Join-Path $repo "tools\verify-runtime.ps1") -Destination $outputPath
 
 $launcher = @'
 @echo off
@@ -103,17 +109,26 @@ exit /b %ERRORLEVEL%
 '@
 Set-Content -LiteralPath (Join-Path $outputPath "indextts-cuda.cmd") -Value $launcher -Encoding Ascii
 
-$manifest = Get-ChildItem -LiteralPath $outputPath -File | Sort-Object Name | ForEach-Object {
-    [pscustomobject]@{
-        name = $_.Name
+$manifest = [ordered]@{
+    package = "index-tts-rust-win64-cuda"
+    architecture = "x86_64-pc-windows-msvc"
+    abi_version = "1.4"
+    backend = "cuda"
+    cuda = "12.8"
+    cudnn = "9"
+    additional_dependencies = @("CUDA 13 cuBLAS compatibility DLLs")
+    files = @{}
+}
+Get-ChildItem -LiteralPath $outputPath -File | Sort-Object Name | ForEach-Object {
+    $manifest.files[$_.Name] = [ordered]@{
         bytes = $_.Length
         sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }
-$manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outputPath "manifest.json") -Encoding UTF8
+$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outputPath "runtime-manifest.json") -Encoding UTF8
 
 $megabytes = [math]::Round(((Get-ChildItem $outputPath -File | Measure-Object Length -Sum).Sum / 1MB), 1)
-Write-Host "Packaged $($manifest.Count) files ($megabytes MiB) to $outputPath"
+Write-Host "Packaged $($manifest.files.Count) files ($megabytes MiB) to $outputPath"
 Write-Host "Run: $outputPath\indextts-cuda.cmd --device cuda --device-index 0 synth ..."
 
 if ($Zip) {
