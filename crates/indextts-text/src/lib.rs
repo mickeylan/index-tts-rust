@@ -369,6 +369,25 @@ mod tests {
     }
 
     #[test]
+    fn long_inputs_preserve_every_character() {
+        for length in [500, 1000, 2000] {
+            let text: String = (0..length)
+                .map(|index| if index % 47 == 46 { '。' } else { '字' })
+                .collect();
+            let segments = segment_text(&text, 120).unwrap();
+            assert_eq!(segments.concat_text(), text);
+            assert!(segments
+                .iter()
+                .all(|segment| segment.text.chars().count() <= 120));
+            assert_eq!(segments.first().unwrap().start_char, 0);
+            assert_eq!(segments.last().unwrap().end_char, length);
+            for pair in segments.windows(2) {
+                assert_eq!(pair[0].end_char, pair[1].start_char);
+            }
+        }
+    }
+
+    #[test]
     fn test_date_normalization() {
         let normalizer = TextNormalizer::new();
         let result = normalizer
