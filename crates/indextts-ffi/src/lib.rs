@@ -88,6 +88,7 @@ pub struct IndexTtsEmotionHandle {
 pub struct IndexTtsRequestHandle {
     model: usize,
     cancelled: Arc<AtomicBool>,
+    started: AtomicBool,
 }
 
 pub type indextts_model_t = *mut IndexTtsModelHandle;
@@ -1048,9 +1049,21 @@ pub unsafe extern "C" fn indextts_request_create(
         *out_request = Box::into_raw(Box::new(IndexTtsRequestHandle {
             model: model as usize,
             cancelled: Arc::new(AtomicBool::new(false)),
+            started: AtomicBool::new(false),
         }));
         Ok(())
     })
+}
+
+fn begin_request(request: &IndexTtsRequestHandle) -> Result<(), String> {
+    request
+        .started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "request handles are single-use".to_string())?;
+    if request.cancelled.load(Ordering::Acquire) {
+        return Err(indextts_core::IndexTtsError::Cancelled.to_string());
+    }
+    Ok(())
 }
 
 #[no_mangle]
@@ -1075,8 +1088,8 @@ pub unsafe extern "C" fn indextts_generate_request_v2(
         }
         *out_audio = indextts_audio_out_t::default();
         let model_ref = &*model;
+        begin_request(&*request)?;
         let _active = ActiveRequestGuard::new(&model_ref.active_requests);
-        (&*request).cancelled.store(false, Ordering::Release);
         let audio = generate_v2_inner(model_ref, &*voice, &*options, &(&*request).cancelled)?;
         store_audio(audio, out_audio);
         Ok(())
@@ -1105,8 +1118,8 @@ pub unsafe extern "C" fn indextts_generate_result_request_v2(
         }
         *out_result = indextts_generation_result_t::default();
         let model_ref = &*model;
+        begin_request(&*request)?;
         let _active = ActiveRequestGuard::new(&model_ref.active_requests);
-        (&*request).cancelled.store(false, Ordering::Release);
         let result =
             generate_result_v2_inner(model_ref, &*voice, &*options, &(&*request).cancelled)?;
         store_audio(result.audio, &mut (*out_result).audio);
@@ -1243,14 +1256,25 @@ mod tests {
         let first = Box::into_raw(Box::new(IndexTtsRequestHandle {
             model: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
+            started: AtomicBool::new(false),
         }));
         let second = Box::into_raw(Box::new(IndexTtsRequestHandle {
             model: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
+            started: AtomicBool::new(false),
         }));
         assert_eq!(unsafe { indextts_request_cancel(first) }, 0);
         assert!(unsafe { (&*first).cancelled.load(Ordering::Acquire) });
         assert!(!unsafe { (&*second).cancelled.load(Ordering::Acquire) });
+        assert_eq!(
+            begin_request(unsafe { &*first }).unwrap_err(),
+            "Generation cancelled"
+        );
+        assert!(begin_request(unsafe { &*second }).is_ok());
+        assert_eq!(
+            begin_request(unsafe { &*second }).unwrap_err(),
+            "request handles are single-use"
+        );
         unsafe { indextts_request_free(first) };
         unsafe { indextts_request_free(second) };
     }
