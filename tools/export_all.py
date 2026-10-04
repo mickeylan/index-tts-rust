@@ -52,6 +52,10 @@ def main() -> None:
         "--output", output / "gpt.safetensors", "--manifest", output / "gpt.manifest.json")
     run(root / "tools/export_wav2vec_stats.py", "--input", args.checkpoints / "wav2vec2bert_stats.pt",
         "--output", output / "wav2vec2bert_stats.safetensors")
+    run(root / "tools/export_emotion_prototypes.py",
+        "--speaker", args.checkpoints / "feat1.pt",
+        "--emotion", args.checkpoints / "feat2.pt",
+        "--output", output / "emotion-prototypes.safetensors")
     for filename in TOKENIZER_FILES:
         shutil.copy2(args.checkpoints / filename, output / filename)
     exporter = root / "tools/export_indextts25_onnx.py"
