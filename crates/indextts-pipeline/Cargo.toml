@@ -20,6 +20,7 @@ indextts-text = { workspace = true }
 indextts-tokenizer = { workspace = true }
 indextts-audio = { workspace = true }
 indextts-gpt = { workspace = true }
+indextts-emotion-qwen = { workspace = true }
 indextts-ort = { workspace = true }
 candle-core = { workspace = true }
 thiserror = { workspace = true }

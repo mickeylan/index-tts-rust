@@ -59,6 +59,11 @@ def main() -> None:
         "--output", output / "emotion-prototypes.safetensors")
     for filename in TOKENIZER_FILES:
         shutil.copy2(args.checkpoints / filename, output / filename)
+    qwen_source = args.checkpoints / "qwen0.6bemo4-merge"
+    qwen_output = output / "qwen0.6bemo4-merge"
+    if qwen_output.exists():
+        shutil.rmtree(qwen_output)
+    shutil.copytree(qwen_source, qwen_output)
     exporter = root / "tools/export_indextts25_onnx.py"
     for component in COMPONENTS:
         run(exporter, component, "--source", args.source, "--model-dir", args.checkpoints,

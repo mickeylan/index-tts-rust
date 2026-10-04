@@ -516,7 +516,7 @@ pub unsafe extern "C" fn indextts_get_capabilities(
             supports_cancellation: 1,
             supports_request_cancellation: 1,
             supports_voice_cache: 1,
-            supports_emotion_text: 0,
+            supports_emotion_text: 1,
             supports_emotion_reference: 1,
             supports_emotion_vector: 1,
             supports_target_duration: 0,
@@ -1130,7 +1130,26 @@ unsafe fn generate_v2_inner(
                 cancelled,
             )
         }
-        INDEXTTS_EMOTION_TEXT => return Err("emotion text is not supported by this runtime".into()),
+        INDEXTTS_EMOTION_TEXT => {
+            let emotion_text = required_utf8(options.emotion.text, "emotion text")?;
+            let emotion = model
+                .pipeline
+                .prepare_emotion_text(
+                    &voice.conditioning,
+                    emotion_text,
+                    options.emotion.strength,
+                    cancelled,
+                )
+                .map_err(|error| error.to_string())?;
+            model.pipeline.synthesize_prepared_with_emotion_cancellable(
+                text,
+                &voice.conditioning,
+                &emotion,
+                1.0,
+                &config,
+                cancelled,
+            )
+        }
         INDEXTTS_EMOTION_VECTOR => {
             if options.emotion.vector.is_null() || options.emotion.vector_length != 8 {
                 return Err("emotion vector must contain exactly 8 values".into());
@@ -1186,7 +1205,28 @@ unsafe fn generate_result_v2_inner(
                     cancelled,
                 )
         }
-        INDEXTTS_EMOTION_TEXT => return Err("emotion text is not supported by this runtime".into()),
+        INDEXTTS_EMOTION_TEXT => {
+            let emotion_text = required_utf8(options.emotion.text, "emotion text")?;
+            let emotion = model
+                .pipeline
+                .prepare_emotion_text(
+                    &voice.conditioning,
+                    emotion_text,
+                    options.emotion.strength,
+                    cancelled,
+                )
+                .map_err(|error| error.to_string())?;
+            model
+                .pipeline
+                .synthesize_prepared_with_emotion_result_cancellable(
+                    text,
+                    &voice.conditioning,
+                    &emotion,
+                    1.0,
+                    &config,
+                    cancelled,
+                )
+        }
         INDEXTTS_EMOTION_VECTOR => {
             if options.emotion.vector.is_null() || options.emotion.vector_length != 8 {
                 return Err("emotion vector must contain exactly 8 values".into());
@@ -1526,7 +1566,7 @@ mod tests {
         assert_eq!(capabilities.supports_request_cancellation, 1);
         assert_eq!(capabilities.supports_voice_cache, 1);
         assert_eq!(capabilities.supports_emotion_reference, 1);
-        assert_eq!(capabilities.supports_emotion_text, 0);
+        assert_eq!(capabilities.supports_emotion_text, 1);
         let options = indextts_generate_options_v2_t::default();
         assert_eq!(options.emotion.mode, INDEXTTS_EMOTION_NONE);
         assert_eq!(options.emotion.strength, 1.0);

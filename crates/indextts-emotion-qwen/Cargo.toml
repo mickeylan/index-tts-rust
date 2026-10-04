@@ -1,0 +1,21 @@
+[package]
+name = "indextts-emotion-qwen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CPU-only Qwen3 emotion text classifier for IndexTTS-2.5"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Deliberately isolated from the validated Candle 0.8 TTS stack. Do not add a
+# cuda feature: this classifier must remain on CPU even in CUDA application builds.
+candle-core-qwen = { package = "candle-core", version = "0.11", default-features = false }
+candle-nn-qwen = { package = "candle-nn", version = "0.11", default-features = false }
+candle-transformers-qwen = { package = "candle-transformers", version = "0.11", default-features = false }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -19,6 +19,7 @@ use indextts_core::{
     AudioBuffer, DeviceConfig, GenerationConfig, Language, ModelConfig, Result as TtsResult,
     SemanticCodes,
 };
+use indextts_emotion_qwen::EmotionTextClassifier;
 use indextts_gpt::{GptConfig, GreedyGenerator, IndexGpt};
 use indextts_ort::{
     run_campplus, run_emotion_conditioner, run_gpt_conditioning, run_length_regulator,
@@ -290,11 +291,6 @@ impl EmotionPrototypeBank {
             .map(|value| (value * strength * 10_000.0).trunc() / 10_000.0)
             .collect();
         let total: f32 = scaled.iter().sum();
-        if total > 0.8001 {
-            return Err(indextts_core::IndexTtsError::BackendFailure(
-                "emotion vector sum after strength must not exceed 0.8".into(),
-            ));
-        }
         let style = speaker_style.as_slice();
         let mut output: Vec<f32> = voice_emotion
             .as_slice()
@@ -337,7 +333,6 @@ impl EmotionPrototypeBank {
 }
 
 /// Runtime for reference-audio + text to greedy semantic codes.
-#[derive(Debug)]
 pub struct SemanticRuntime {
     reference: ReferenceEncoder,
     tokenizer: IndexTtsTokenizer,
@@ -348,6 +343,8 @@ pub struct SemanticRuntime {
     dit_buckets: DitBuckets,
     bigvgan_buckets: BigVganBuckets,
     emotion_prototypes: Option<EmotionPrototypeBank>,
+    emotion_text: Option<EmotionTextClassifier>,
+    emotion_text_dir: std::path::PathBuf,
 }
 
 impl SemanticRuntime {
@@ -424,6 +421,8 @@ impl SemanticRuntime {
                     None
                 }
             },
+            emotion_text: None,
+            emotion_text_dir: model_dir.join("qwen0.6bemo4-merge"),
         })
     }
 
@@ -867,7 +866,6 @@ fn concatenate_long_text(
 }
 
 /// End-to-end IndexTTS pipeline.
-#[derive(Debug)]
 pub struct IndexTtsPipeline {
     config: ModelConfig,
     runtime: Option<Mutex<SemanticRuntime>>,
@@ -936,12 +934,63 @@ impl IndexTtsPipeline {
         runtime.reference.encode_emotion(reference_audio_path)
     }
 
+    pub fn prepare_emotion_text(
+        &self,
+        voice: &ReferenceConditioning,
+        text: &str,
+        strength: f32,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<PreparedEmotion> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let mut runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        if runtime.emotion_text.is_none() {
+            runtime.emotion_text = Some(
+                EmotionTextClassifier::load(&runtime.emotion_text_dir).map_err(|error| {
+                    indextts_core::IndexTtsError::InvalidModel(error.to_string())
+                })?,
+            );
+        }
+        let weights = runtime
+            .emotion_text
+            .as_mut()
+            .expect("initialized above")
+            .classify(text, cancelled)
+            .map_err(|error| match error {
+                indextts_emotion_qwen::EmotionTextError::Cancelled => {
+                    indextts_core::IndexTtsError::Cancelled
+                }
+                error => indextts_core::IndexTtsError::BackendFailure(error.to_string()),
+            })?;
+        let bank = runtime.emotion_prototypes.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "model package has no emotion prototype bank".into(),
+            )
+        })?;
+        let voice_emotion = voice.voice_emotion.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "prepared voice has no emotion embedding".into(),
+            )
+        })?;
+        bank.mix(&voice.speaker_style, voice_emotion, &weights, strength)
+    }
+
     pub fn prepare_emotion_vector(
         &self,
         voice: &ReferenceConditioning,
         weights: &[f32; 8],
         strength: f32,
     ) -> TtsResult<PreparedEmotion> {
+        if weights.iter().sum::<f32>() * strength > 0.8001 {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "emotion vector sum after strength must not exceed 0.8".into(),
+            ));
+        }
         let runtime = self.runtime.as_ref().ok_or_else(|| {
             indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
         })?;

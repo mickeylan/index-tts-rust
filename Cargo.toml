@@ -6,6 +6,7 @@ members = [
     "crates/indextts-tokenizer",
     "crates/indextts-audio",
     "crates/indextts-gpt",
+    "crates/indextts-emotion-qwen",
     "crates/indextts-ort",
     "crates/indextts-pipeline",
     "crates/indextts-ffi",
@@ -30,6 +31,7 @@ indextts-text = { path = "crates/indextts-text" }
 indextts-tokenizer = { path = "crates/indextts-tokenizer" }
 indextts-audio = { path = "crates/indextts-audio" }
 indextts-gpt = { path = "crates/indextts-gpt" }
+indextts-emotion-qwen = { path = "crates/indextts-emotion-qwen" }
 indextts-ort = { path = "crates/indextts-ort" }
 indextts-pipeline = { path = "crates/indextts-pipeline" }
 indextts-ffi = { path = "crates/indextts-ffi" }

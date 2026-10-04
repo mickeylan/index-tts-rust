@@ -402,7 +402,12 @@ func (m *Model) GenerateV2ResultContext(ctx context.Context, v *Voice, text stri
 		}
 		config.emotion.reference = C.indextts_emotion_t(emotion.h)
 	} else if options.Emotion.Mode == EmotionText {
-		return GenerationResult{}, errors.New("emotion text is not supported by this runtime")
+		if options.Emotion.Text == "" {
+			return GenerationResult{}, errors.New("emotion text is empty")
+		}
+		emotionText := C.CString(options.Emotion.Text)
+		defer C.free(unsafe.Pointer(emotionText))
+		config.emotion.text = emotionText
 	} else if options.Emotion.Mode == EmotionVector {
 		if len(options.Emotion.Vector) != 8 {
 			return GenerationResult{}, errors.New("emotion vector must contain exactly 8 values")
