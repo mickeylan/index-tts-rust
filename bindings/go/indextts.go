@@ -444,18 +444,27 @@ func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, op
 	if err := ctx.Err(); err != nil {
 		return Audio{}, err
 	}
+	var request C.indextts_request_t
+	nativeMu.Lock()
+	if C.indextts_request_create(m.h, &request) != C.INDEXTTS_OK {
+		err := nativeError()
+		nativeMu.Unlock()
+		return Audio{}, err
+	}
+	nativeMu.Unlock()
+	defer C.indextts_request_free(request)
 	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
 		select {
 		case <-ctx.Done():
-			_ = m.Cancel()
+			C.indextts_request_cancel(request)
 		case <-done:
 		}
 	}()
 	var output C.indextts_audio_out_t
 	nativeMu.Lock()
-	status := C.indextts_generate_v2(m.h, v.h, &config, &output)
+	status := C.indextts_generate_request_v2(m.h, request, v.h, &config, &output)
 	var nativeErr error
 	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
 		nativeErr = nativeError()

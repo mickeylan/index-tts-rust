@@ -21,9 +21,11 @@ extern "C" {
 struct IndexTtsModelHandle;
 struct IndexTtsVoiceHandle;
 struct IndexTtsEmotionHandle;
+struct IndexTtsRequestHandle;
 typedef struct IndexTtsModelHandle *indextts_model_t;
 typedef struct IndexTtsVoiceHandle *indextts_voice_t;
 typedef struct IndexTtsEmotionHandle *indextts_emotion_t;
+typedef struct IndexTtsRequestHandle *indextts_request_t;
 
 typedef struct {
     const char *model_dir;
@@ -134,6 +136,10 @@ INDEXTTS_API int32_t indextts_generate(indextts_model_t model, indextts_voice_t 
 INDEXTTS_API int32_t indextts_emotion_prepare_reference(indextts_model_t model, const char *reference_audio_path, indextts_emotion_t *out_emotion);
 INDEXTTS_API int32_t indextts_generate_v2(indextts_model_t model, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_audio_out_t *out_audio);
 INDEXTTS_API void indextts_emotion_free(indextts_emotion_t emotion);
+INDEXTTS_API int32_t indextts_request_create(indextts_model_t model, indextts_request_t *out_request);
+INDEXTTS_API int32_t indextts_generate_request_v2(indextts_model_t model, indextts_request_t request, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_audio_out_t *out_audio);
+INDEXTTS_API int32_t indextts_request_cancel(indextts_request_t request);
+INDEXTTS_API void indextts_request_free(indextts_request_t request);
 /* Thread-safe cooperative cancellation; returns immediately. */
 INDEXTTS_API int32_t indextts_model_cancel(indextts_model_t model);
 INDEXTTS_API void indextts_audio_free(indextts_audio_out_t *audio);

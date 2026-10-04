@@ -3,7 +3,9 @@
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
 use indextts_audio::process_reference_audio;
-use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};
+use indextts_core::{
+    AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision,
+};
 use indextts_pipeline::{IndexTtsPipeline, PreparedEmotion, ReferenceConditioning};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
@@ -69,10 +71,15 @@ impl VoiceCache {
 pub struct IndexTtsEmotionHandle {
     emotion: PreparedEmotion,
 }
+pub struct IndexTtsRequestHandle {
+    model: usize,
+    cancelled: Arc<AtomicBool>,
+}
 
 pub type indextts_model_t = *mut IndexTtsModelHandle;
 pub type indextts_voice_t = *mut IndexTtsVoiceHandle;
 pub type indextts_emotion_t = *mut IndexTtsEmotionHandle;
+pub type indextts_request_t = *mut IndexTtsRequestHandle;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -259,7 +266,7 @@ impl Default for indextts_voice_info_t {
 }
 
 const ABI_MAJOR: u32 = 1;
-const ABI_MINOR: u32 = 1;
+const ABI_MINOR: u32 = 2;
 
 static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
@@ -398,7 +405,7 @@ pub unsafe extern "C" fn indextts_get_capabilities(
             supports_cuda: cfg!(feature = "cuda") as i32,
             supports_cpu: 1,
             supports_cancellation: 1,
-            supports_request_cancellation: 0,
+            supports_request_cancellation: 1,
             supports_voice_cache: 1,
             supports_emotion_text: 0,
             supports_emotion_reference: 1,
@@ -705,6 +712,60 @@ pub unsafe extern "C" fn indextts_generate(
     })
 }
 
+unsafe fn generate_v2_inner(
+    model: &IndexTtsModelHandle,
+    voice: &IndexTtsVoiceHandle,
+    options: &indextts_generate_options_v2_t,
+    cancelled: &AtomicBool,
+) -> Result<AudioBuffer, String> {
+    validate_reserved(&options.reserved)?;
+    validate_reserved(&options.emotion.reserved)?;
+    let (text, config) = parse_generation_options(&options.base)?;
+    match options.emotion.mode {
+        INDEXTTS_EMOTION_NONE => model.pipeline.synthesize_prepared_cancellable(
+            text,
+            &voice.conditioning,
+            &config,
+            cancelled,
+        ),
+        INDEXTTS_EMOTION_REFERENCE => {
+            if options.emotion.reference.is_null() {
+                return Err("emotion reference handle is required".into());
+            }
+            model.pipeline.synthesize_prepared_with_emotion_cancellable(
+                text,
+                &voice.conditioning,
+                &(&*options.emotion.reference).emotion,
+                options.emotion.strength,
+                &config,
+                cancelled,
+            )
+        }
+        INDEXTTS_EMOTION_TEXT => return Err("emotion text is not supported by this runtime".into()),
+        INDEXTTS_EMOTION_VECTOR => {
+            if options.emotion.vector.is_null() || options.emotion.vector_length != 8 {
+                return Err("emotion vector must contain exactly 8 values".into());
+            }
+            let values = std::slice::from_raw_parts(options.emotion.vector, 8);
+            let weights: [f32; 8] = values.try_into().map_err(|_| "invalid emotion vector")?;
+            let emotion = model
+                .pipeline
+                .prepare_emotion_vector(&voice.conditioning, &weights, options.emotion.strength)
+                .map_err(|error| error.to_string())?;
+            model.pipeline.synthesize_prepared_with_emotion_cancellable(
+                text,
+                &voice.conditioning,
+                &emotion,
+                1.0,
+                &config,
+                cancelled,
+            )
+        }
+        mode => return Err(format!("unsupported emotion mode {mode}")),
+    }
+    .map_err(|error| error.to_string())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indextts_generate_v2(
     model: indextts_model_t,
@@ -717,64 +778,79 @@ pub unsafe extern "C" fn indextts_generate_v2(
             return Err("invalid arguments".into());
         }
         *out_audio = indextts_audio_out_t::default();
-        let options = &*options;
-        validate_reserved(&options.reserved)?;
-        validate_reserved(&options.emotion.reserved)?;
-        let (text, config) = parse_generation_options(&options.base)?;
         let model = &*model;
         model.cancelled.store(false, Ordering::Release);
-        let audio = match options.emotion.mode {
-            INDEXTTS_EMOTION_NONE => model.pipeline.synthesize_prepared_cancellable(
-                text,
-                &(&*voice).conditioning,
-                &config,
-                &model.cancelled,
-            ),
-            INDEXTTS_EMOTION_REFERENCE => {
-                if options.emotion.reference.is_null() {
-                    return Err("emotion reference handle is required".into());
-                }
-                model.pipeline.synthesize_prepared_with_emotion_cancellable(
-                    text,
-                    &(&*voice).conditioning,
-                    &(&*options.emotion.reference).emotion,
-                    options.emotion.strength,
-                    &config,
-                    &model.cancelled,
-                )
-            }
-            INDEXTTS_EMOTION_TEXT => {
-                return Err("emotion text is not supported by this runtime".into())
-            }
-            INDEXTTS_EMOTION_VECTOR => {
-                if options.emotion.vector.is_null() || options.emotion.vector_length != 8 {
-                    return Err("emotion vector must contain exactly 8 values".into());
-                }
-                let values = std::slice::from_raw_parts(options.emotion.vector, 8);
-                let weights: [f32; 8] = values.try_into().map_err(|_| "invalid emotion vector")?;
-                let emotion = model
-                    .pipeline
-                    .prepare_emotion_vector(
-                        &(&*voice).conditioning,
-                        &weights,
-                        options.emotion.strength,
-                    )
-                    .map_err(|error| error.to_string())?;
-                model.pipeline.synthesize_prepared_with_emotion_cancellable(
-                    text,
-                    &(&*voice).conditioning,
-                    &emotion,
-                    1.0,
-                    &config,
-                    &model.cancelled,
-                )
-            }
-            mode => return Err(format!("unsupported emotion mode {mode}")),
-        }
-        .map_err(|error| error.to_string())?;
+        let audio = generate_v2_inner(model, &*voice, &*options, &model.cancelled)?;
         store_audio(audio, out_audio);
         Ok(())
     })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_request_create(
+    model: indextts_model_t,
+    out_request: *mut indextts_request_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || out_request.is_null() {
+            return Err("invalid arguments".into());
+        }
+        *out_request = Box::into_raw(Box::new(IndexTtsRequestHandle {
+            model: model as usize,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate_request_v2(
+    model: indextts_model_t,
+    request: indextts_request_t,
+    voice: indextts_voice_t,
+    options: *const indextts_generate_options_v2_t,
+    out_audio: *mut indextts_audio_out_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null()
+            || request.is_null()
+            || voice.is_null()
+            || options.is_null()
+            || out_audio.is_null()
+        {
+            return Err("invalid arguments".into());
+        }
+        if (&*request).model != model as usize {
+            return Err("request belongs to another model".into());
+        }
+        *out_audio = indextts_audio_out_t::default();
+        (&*request).cancelled.store(false, Ordering::Release);
+        let audio = generate_v2_inner(&*model, &*voice, &*options, &(&*request).cancelled)?;
+        store_audio(audio, out_audio);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_request_cancel(request: indextts_request_t) -> i32 {
+    if request.is_null() {
+        return -1;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        (&*request).cancelled.store(true, Ordering::Release)
+    })) {
+        Ok(()) => 0,
+        Err(_) => -2,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_request_free(request: indextts_request_t) {
+    ffi_void(|| {
+        if !request.is_null() {
+            drop(Box::from_raw(request));
+        }
+    });
 }
 
 /// Request cooperative cancellation of the model's active generation.
@@ -861,21 +937,38 @@ mod tests {
     }
     #[test]
     fn abi_version_and_capabilities_are_truthful() {
-        assert_eq!(indextts_abi_version(), 0x0001_0001);
+        assert_eq!(indextts_abi_version(), 0x0001_0002);
         let mut capabilities = indextts_capabilities_t::default();
         assert_eq!(unsafe { indextts_get_capabilities(&mut capabilities) }, 0);
         assert_eq!(capabilities.abi_major, 1);
-        assert_eq!(capabilities.abi_minor, 1);
+        assert_eq!(capabilities.abi_minor, 2);
         assert_eq!(capabilities.sample_rate, 22_050);
         assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
         assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);
-        assert_eq!(capabilities.supports_request_cancellation, 0);
+        assert_eq!(capabilities.supports_request_cancellation, 1);
         assert_eq!(capabilities.supports_voice_cache, 1);
         assert_eq!(capabilities.supports_emotion_reference, 1);
         assert_eq!(capabilities.supports_emotion_text, 0);
         let options = indextts_generate_options_v2_t::default();
         assert_eq!(options.emotion.mode, INDEXTTS_EMOTION_NONE);
         assert_eq!(options.emotion.strength, 1.0);
+    }
+
+    #[test]
+    fn request_cancellation_is_independent() {
+        let first = Box::into_raw(Box::new(IndexTtsRequestHandle {
+            model: 1,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }));
+        let second = Box::into_raw(Box::new(IndexTtsRequestHandle {
+            model: 1,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }));
+        assert_eq!(unsafe { indextts_request_cancel(first) }, 0);
+        assert!(unsafe { (&*first).cancelled.load(Ordering::Acquire) });
+        assert!(!unsafe { (&*second).cancelled.load(Ordering::Acquire) });
+        unsafe { indextts_request_free(first) };
+        unsafe { indextts_request_free(second) };
     }
 
     #[test]
