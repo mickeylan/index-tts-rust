@@ -396,16 +396,11 @@ impl SemanticRuntime {
                 &OnnxModel::LengthRegulator.path(model_dir),
                 cuda_device,
             )?,
-            dit_buckets: DitBuckets::load_with_device(
-                model_dir,
-                &[256, 512, 1024, 2048, 4096, 8192],
-                cuda_device,
-            )?,
-            bigvgan_buckets: BigVganBuckets::load_with_device(
-                model_dir,
-                &[256, 512, 1024, 2048, 4096, 8192],
-                cuda_device,
-            )?,
+            // Loading every exported bucket eagerly duplicates ORT model weights and can
+            // exhaust desktop VRAM. Keep only the buckets verified safe in production.
+            dit_buckets: DitBuckets::load_with_device(model_dir, &[256, 512, 1024], cuda_device)?,
+            // BigVGAN 1024 remains excluded because it crashes on Windows.
+            bigvgan_buckets: BigVganBuckets::load_with_device(model_dir, &[256, 512], cuda_device)?,
             emotion_prototypes: {
                 let path = model_dir.join("emotion-prototypes.safetensors");
                 if path.is_file() {
