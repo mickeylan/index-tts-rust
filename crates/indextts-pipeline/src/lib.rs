@@ -414,19 +414,25 @@ impl SemanticRuntime {
             .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
         gpt.load_weights(&model_dir.join("gpt.safetensors"))
             .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
+        let semantic_codec =
+            OnnxSession::load_with_device(&OnnxModel::SemanticCodec.path(model_dir), cuda_device)?;
+        semantic_codec
+            .validate_contract(&[("codes", "Int64")], &[("semantic_features", "Float32")])?;
+        let length_regulator = OnnxSession::load_with_device(
+            &OnnxModel::LengthRegulator.path(model_dir),
+            cuda_device,
+        )?;
+        length_regulator.validate_contract(
+            &[("semantic_features", "Float32"), ("target_length", "Int64")],
+            &[("condition", "Float32")],
+        )?;
         Ok(Self {
             reference: ReferenceEncoder::load_with_device(model_dir, cuda_device)?,
             tokenizer: IndexTtsTokenizer::from_dir(model_dir)?,
             normalizer: TextNormalizer::new(),
             gpt,
-            semantic_codec: OnnxSession::load_with_device(
-                &OnnxModel::SemanticCodec.path(model_dir),
-                cuda_device,
-            )?,
-            length_regulator: OnnxSession::load_with_device(
-                &OnnxModel::LengthRegulator.path(model_dir),
-                cuda_device,
-            )?,
+            semantic_codec,
+            length_regulator,
             // Loading every exported bucket eagerly duplicates ORT model weights and can
             // exhaust desktop VRAM. Keep only the buckets verified safe in production.
             dit_buckets: DitBuckets::load_with_device(model_dir, &[256, 512, 1024], cuda_device)?,

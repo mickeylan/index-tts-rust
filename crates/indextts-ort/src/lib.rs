@@ -574,10 +574,19 @@ impl DitBuckets {
                 .join("s2mel")
                 .join(format!("model-{frames}.onnx"));
             if path.is_file() {
-                buckets.push(DitBucket {
-                    frames,
-                    session: OnnxSession::load_with_device(&path, cuda_device)?,
-                });
+                let session = OnnxSession::load_with_device(&path, cuda_device)?;
+                session.validate_contract(
+                    &[
+                        ("x", "Float32"),
+                        ("prompt_x", "Float32"),
+                        ("x_lens", "Int64"),
+                        ("t", "Float32"),
+                        ("style", "Float32"),
+                        ("condition", "Float32"),
+                    ],
+                    &[("velocity", "Float32")],
+                )?;
+                buckets.push(DitBucket { frames, session });
             }
         }
         buckets.sort_by_key(|bucket| bucket.frames);
@@ -892,10 +901,9 @@ impl BigVganBuckets {
                 .join("bigvgan")
                 .join(format!("model-{frames}.onnx"));
             if path.is_file() {
-                buckets.push(DitBucket {
-                    frames,
-                    session: OnnxSession::load_with_device(&path, cuda_device)?,
-                });
+                let session = OnnxSession::load_with_device(&path, cuda_device)?;
+                session.validate_contract(&[("mel", "Float32")], &[("audio", "Float32")])?;
+                buckets.push(DitBucket { frames, session });
             }
         }
         buckets.sort_by_key(|bucket| bucket.frames);
