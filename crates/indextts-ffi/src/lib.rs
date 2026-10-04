@@ -12,8 +12,8 @@ use indextts_pipeline::{
     GenerationDiagnostics, IndexTtsPipeline, PreparedEmotion, ReferenceConditioning,
     SynthesisResult,
 };
-use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -336,19 +336,17 @@ impl Default for indextts_voice_info_t {
 const ABI_MAJOR: u32 = 1;
 const ABI_MINOR: u32 = 4;
 
-static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
+thread_local! {
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
 static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 fn set_last_error(message: impl AsRef<str>) {
     let sanitized = message.as_ref().replace('\0', "\\0");
-    if let Ok(mut error) = LAST_ERROR.lock() {
-        *error = CString::new(sanitized).ok();
-    }
+    LAST_ERROR.with(|error| *error.borrow_mut() = CString::new(sanitized).ok());
 }
 fn clear_last_error() {
-    if let Ok(mut error) = LAST_ERROR.lock() {
-        *error = None;
-    }
+    LAST_ERROR.with(|error| *error.borrow_mut() = None);
 }
 fn ffi_status(operation: impl FnOnce() -> Result<(), String>) -> i32 {
     clear_last_error();
@@ -1210,11 +1208,12 @@ pub unsafe extern "C" fn indextts_model_free(model: indextts_model_t) {
 }
 #[no_mangle]
 pub extern "C" fn indextts_last_error() -> *const libc::c_char {
-    LAST_ERROR
-        .lock()
-        .ok()
-        .and_then(|error| error.as_ref().map(|value| value.as_ptr()))
-        .unwrap_or(std::ptr::null())
+    LAST_ERROR.with(|error| {
+        error
+            .borrow()
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr())
+    })
 }
 #[no_mangle]
 pub extern "C" fn indextts_version() -> *const libc::c_char {
@@ -1294,6 +1293,29 @@ mod tests {
             "example"
         );
     }
+    #[test]
+    fn errors_are_thread_local() {
+        set_last_error("main");
+        std::thread::spawn(|| {
+            assert!(indextts_last_error().is_null());
+            set_last_error("worker");
+            assert_eq!(
+                unsafe { CStr::from_ptr(indextts_last_error()) }
+                    .to_str()
+                    .unwrap(),
+                "worker"
+            );
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            unsafe { CStr::from_ptr(indextts_last_error()) }
+                .to_str()
+                .unwrap(),
+            "main"
+        );
+    }
+
     #[test]
     fn cancellation_sets_model_flag() {
         let handle = Box::new(IndexTtsModelHandle {

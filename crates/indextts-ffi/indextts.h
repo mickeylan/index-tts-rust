@@ -181,7 +181,7 @@ INDEXTTS_API void indextts_audio_free(indextts_audio_out_t *audio);
 INDEXTTS_API void indextts_voice_free(indextts_voice_t voice);
 INDEXTTS_API void indextts_model_free(indextts_model_t model);
 
-/* Pointer remains valid until a later API call changes the process-wide error. */
+/* Thread-local pointer valid until a later API call on the same thread changes the error. */
 INDEXTTS_API const char *indextts_last_error(void);
 /* Static pointer valid for the lifetime of the process. */
 INDEXTTS_API const char *indextts_version(void);
