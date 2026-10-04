@@ -122,3 +122,25 @@ type GenerationResult struct {
 	Audio Audio
 	Info  GenerationInfo
 }
+
+// LongTextOptions controls deterministic segmentation and inter-segment silence.
+type LongTextOptions struct {
+	MaxChars int
+	Pause    time.Duration
+}
+
+// LongTextSegment describes one segment in NormalizedText and Audio.
+type LongTextSegment struct {
+	StartChar, EndChar                       int
+	SemanticTokens                           uint32
+	AudioOffsetSamples, AudioDurationSamples int
+	Seed                                     uint64
+}
+
+// LongTextResult owns Go copies of all data returned by native long-text synthesis.
+type LongTextResult struct {
+	Audio          Audio
+	Info           GenerationInfo
+	NormalizedText string
+	Segments       []LongTextSegment
+}

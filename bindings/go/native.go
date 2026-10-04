@@ -14,6 +14,7 @@ import (
 	"errors"
 	"runtime"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -469,6 +470,154 @@ func (m *Model) GenerateV2ResultContext(ctx context.Context, v *Voice, text stri
 			Peak: float32(output.info.peak), RMS: float32(output.info.rms), SilenceRatio: float32(output.info.silence_ratio),
 			Seed: uint64(output.info.seed),
 		},
+	}, nil
+}
+
+func (m *Model) GenerateLongTextResult(v *Voice, text string, options Options, longText LongTextOptions) (LongTextResult, error) {
+	return m.GenerateLongTextResultContext(context.Background(), v, text, options, longText)
+}
+
+func (m *Model) GenerateLongTextResultContext(ctx context.Context, v *Voice, text string, options Options, longText LongTextOptions) (LongTextResult, error) {
+	if ctx == nil {
+		return LongTextResult{}, errors.New("context is nil")
+	}
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
+	if v == nil {
+		return LongTextResult{}, errors.New("model or voice is closed")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if m.h == nil || v.h == nil || v.model != m {
+		return LongTextResult{}, errors.New("model or voice is closed or mismatched")
+	}
+	if options.Language == "" {
+		options.Language = "ZH"
+	}
+	if options.DurationFactor == 0 {
+		options.DurationFactor = 1
+	}
+	if longText.MaxChars < 0 {
+		return LongTextResult{}, errors.New("long-text max characters must be non-negative")
+	}
+	if longText.Pause < 0 {
+		return LongTextResult{}, errors.New("long-text pause must be non-negative")
+	}
+
+	ctext, clang := C.CString(text), C.CString(options.Language)
+	defer C.free(unsafe.Pointer(ctext))
+	defer C.free(unsafe.Pointer(clang))
+	var config C.indextts_generate_options_t
+	C.indextts_generate_options_init(&config)
+	config.text, config.language = ctext, clang
+	config.seed, config.duration_factor = C.uint64_t(options.Seed), C.float(options.DurationFactor)
+	var longConfig C.indextts_long_text_options_t
+	C.indextts_long_text_options_init(&longConfig)
+	if longText.MaxChars != 0 {
+		longConfig.max_chars = C.size_t(longText.MaxChars)
+		if int(longConfig.max_chars) != longText.MaxChars {
+			return LongTextResult{}, errors.New("long-text max characters is too large")
+		}
+	}
+	longConfig.pause_ms = C.uint64_t(longText.Pause / time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		return LongTextResult{}, err
+	}
+
+	var request C.indextts_request_t
+	if _, err := nativeCall(func() C.int32_t {
+		return C.indextts_request_create(C.indextts_model_t(m.h), &request)
+	}); err != nil {
+		return LongTextResult{}, err
+	}
+	defer C.indextts_request_free(request)
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_, _ = nativeCall(func() C.int32_t { return C.indextts_request_cancel(request) })
+		case <-done:
+		}
+	}()
+	var output C.indextts_long_text_result_t
+	status, nativeErr := nativeCall(func() C.int32_t {
+		return C.indextts_generate_long_text_result_request(C.indextts_model_t(m.h), request, C.indextts_voice_t(v.h), &config, &longConfig, &output)
+	})
+	close(done)
+	<-stopped
+	defer C.indextts_long_text_result_free(&output)
+	if status == C.INDEXTTS_CANCELLED {
+		if err := ctx.Err(); err != nil {
+			return LongTextResult{}, err
+		}
+		return LongTextResult{}, ErrCancelled
+	}
+	if status != C.INDEXTTS_OK {
+		return LongTextResult{}, nativeErr
+	}
+
+	sampleCount := int(output.audio.sample_count)
+	if sampleCount < 0 || C.size_t(sampleCount) != output.audio.sample_count {
+		return LongTextResult{}, errors.New("native audio is too large for this Go process")
+	}
+	if sampleCount != 0 && output.audio.samples == nil {
+		return LongTextResult{}, errors.New("native audio pointer is nil")
+	}
+	segmentCount := int(output.segment_count)
+	if segmentCount < 0 || C.size_t(segmentCount) != output.segment_count {
+		return LongTextResult{}, errors.New("native segment array is too large for this Go process")
+	}
+	if segmentCount != 0 && output.segments == nil {
+		return LongTextResult{}, errors.New("native segment pointer is nil")
+	}
+	textLength := int(output.normalized_text_length)
+	if textLength < 0 || C.size_t(textLength) != output.normalized_text_length {
+		return LongTextResult{}, errors.New("normalized text is too large for this Go process")
+	}
+	if textLength != 0 && output.normalized_text == nil {
+		return LongTextResult{}, errors.New("native normalized text pointer is nil")
+	}
+
+	audio := append([]float32(nil), unsafe.Slice((*float32)(unsafe.Pointer(output.audio.samples)), sampleCount)...)
+	normalizedText := string(unsafe.Slice((*byte)(unsafe.Pointer(output.normalized_text)), textLength))
+	if !utf8.ValidString(normalizedText) {
+		return LongTextResult{}, errors.New("native normalized text is not valid UTF-8")
+	}
+	normalizedCharCount := utf8.RuneCountInString(normalizedText)
+	nativeSegments := unsafe.Slice((*C.indextts_long_text_segment_t)(unsafe.Pointer(output.segments)), segmentCount)
+	segments := make([]LongTextSegment, segmentCount)
+	for index, segment := range nativeSegments {
+		start, end := int(segment.start_char), int(segment.end_char)
+		offset, duration := int(segment.audio_offset_samples), int(segment.audio_duration_samples)
+		if start < 0 || C.size_t(start) != segment.start_char || end < 0 || C.size_t(end) != segment.end_char ||
+			offset < 0 || C.size_t(offset) != segment.audio_offset_samples || duration < 0 || C.size_t(duration) != segment.audio_duration_samples {
+			return LongTextResult{}, errors.New("native segment metadata is too large for this Go process")
+		}
+		if start > end || end > normalizedCharCount || offset > sampleCount || duration > sampleCount-offset {
+			return LongTextResult{}, errors.New("native segment metadata contains an invalid range")
+		}
+		segments[index] = LongTextSegment{
+			StartChar: start, EndChar: end, SemanticTokens: uint32(segment.semantic_token_count),
+			AudioOffsetSamples: offset, AudioDurationSamples: duration, Seed: uint64(segment.seed),
+		}
+	}
+	runtime.KeepAlive(v)
+	milliseconds := func(value C.float) time.Duration { return time.Duration(float64(value) * float64(time.Millisecond)) }
+	return LongTextResult{
+		Audio: Audio{Samples: audio, SampleRate: uint32(output.audio.sample_rate), Channels: uint32(output.audio.channels)},
+		Info: GenerationInfo{
+			SemanticTokens: uint32(output.info.semantic_token_count), GeneratedSeconds: float32(output.info.generated_seconds),
+			ReferenceEncode: milliseconds(output.info.reference_encode_ms), GPT: milliseconds(output.info.gpt_ms),
+			SemanticCodec: milliseconds(output.info.semantic_codec_ms), S2Mel: milliseconds(output.info.s2mel_ms),
+			BigVGAN: milliseconds(output.info.bigvgan_ms), Total: milliseconds(output.info.total_ms),
+			Peak: float32(output.info.peak), RMS: float32(output.info.rms), SilenceRatio: float32(output.info.silence_ratio),
+			Seed: uint64(output.info.seed),
+		},
+		NormalizedText: normalizedText,
+		Segments:       segments,
 	}, nil
 }
 

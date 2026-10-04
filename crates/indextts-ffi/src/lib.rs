@@ -9,8 +9,8 @@ use indextts_core::{
     AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision,
 };
 use indextts_pipeline::{
-    GenerationDiagnostics, IndexTtsPipeline, PreparedEmotion, ReferenceConditioning,
-    SynthesisResult,
+    GenerationDiagnostics, IndexTtsPipeline, LongTextConfig, LongTextSegment,
+    LongTextSynthesisResult, PreparedEmotion, ReferenceConditioning, SynthesisResult,
 };
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -235,6 +235,62 @@ pub struct indextts_generation_result_t {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct indextts_long_text_options_t {
+    pub max_chars: usize,
+    pub pause_ms: u64,
+    pub reserved: [u64; 4],
+}
+
+impl Default for indextts_long_text_options_t {
+    fn default() -> Self {
+        Self {
+            max_chars: 200,
+            pause_ms: 200,
+            reserved: [0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct indextts_long_text_segment_t {
+    pub start_char: usize,
+    pub end_char: usize,
+    pub semantic_token_count: u32,
+    pub audio_offset_samples: usize,
+    pub audio_duration_samples: usize,
+    pub seed: u64,
+    pub reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct indextts_long_text_result_t {
+    pub audio: indextts_audio_out_t,
+    pub info: indextts_generation_info_t,
+    pub normalized_text: *mut libc::c_char,
+    pub normalized_text_length: usize,
+    pub segments: *mut indextts_long_text_segment_t,
+    pub segment_count: usize,
+    pub reserved: [u64; 4],
+}
+
+impl Default for indextts_long_text_result_t {
+    fn default() -> Self {
+        Self {
+            audio: indextts_audio_out_t::default(),
+            info: indextts_generation_info_t::default(),
+            normalized_text: std::ptr::null_mut(),
+            normalized_text_length: 0,
+            segments: std::ptr::null_mut(),
+            segment_count: 0,
+            reserved: [0; 4],
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct indextts_capabilities_t {
     pub abi_major: u32,
@@ -334,7 +390,7 @@ impl Default for indextts_voice_info_t {
 }
 
 const ABI_MAJOR: u32 = 1;
-const ABI_MINOR: u32 = 4;
+const ABI_MINOR: u32 = 5;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -566,6 +622,17 @@ pub unsafe extern "C" fn indextts_generate_options_v2_init(
     ffi_void(|| {
         if !options.is_null() {
             *options = indextts_generate_options_v2_t::default();
+        }
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_long_text_options_init(
+    options: *mut indextts_long_text_options_t,
+) {
+    ffi_void(|| {
+        if !options.is_null() {
+            *options = indextts_long_text_options_t::default();
         }
     });
 }
@@ -857,6 +924,78 @@ fn generation_info(value: GenerationDiagnostics) -> indextts_generation_info_t {
     }
 }
 
+fn long_text_segment(value: LongTextSegment) -> indextts_long_text_segment_t {
+    indextts_long_text_segment_t {
+        start_char: value.text_range.start,
+        end_char: value.text_range.end,
+        semantic_token_count: value.semantic_token_count,
+        audio_offset_samples: value.audio_offset_samples,
+        audio_duration_samples: value.audio_duration_samples,
+        seed: value.seed,
+        reserved: [0; 4],
+    }
+}
+
+unsafe fn store_long_text_result(
+    result: LongTextSynthesisResult,
+    out_result: *mut indextts_long_text_result_t,
+) -> Result<(), String> {
+    let normalized_char_count = result.normalized_text.chars().count();
+    let audio_sample_count = result.audio.samples.len();
+    for segment in &result.segments {
+        if segment.text_range.start > segment.text_range.end
+            || segment.text_range.end > normalized_char_count
+        {
+            return Err("long-text result contains an invalid character range".into());
+        }
+        let audio_end = segment
+            .audio_offset_samples
+            .checked_add(segment.audio_duration_samples)
+            .ok_or_else(|| "long-text result contains an invalid audio range".to_string())?;
+        if audio_end > audio_sample_count {
+            return Err("long-text result contains an invalid audio range".into());
+        }
+    }
+
+    let normalized_text_length = result.normalized_text.len();
+    let normalized_text = CString::new(result.normalized_text)
+        .map_err(|_| "normalized text contains an interior NUL byte".to_string())?;
+    let mut segments = result
+        .segments
+        .into_iter()
+        .map(long_text_segment)
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let segment_count = segments.len();
+    let segment_pointer = if segment_count == 0 {
+        std::ptr::null_mut()
+    } else {
+        segments.as_mut_ptr()
+    };
+    let info = generation_info(result.diagnostics);
+    let mut samples = result.audio.samples.into_boxed_slice();
+    let audio = indextts_audio_out_t {
+        samples: samples.as_mut_ptr(),
+        sample_count: samples.len(),
+        sample_rate: result.audio.sample_rate,
+        channels: result.audio.channels as u32,
+        reserved: [0; 4],
+    };
+
+    *out_result = indextts_long_text_result_t {
+        audio,
+        info,
+        normalized_text: normalized_text.into_raw(),
+        normalized_text_length,
+        segments: segment_pointer,
+        segment_count,
+        reserved: [0; 4],
+    };
+    std::mem::forget(samples);
+    std::mem::forget(segments);
+    Ok(())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indextts_generate(
     model: indextts_model_t,
@@ -1126,6 +1265,61 @@ pub unsafe extern "C" fn indextts_generate_result_request_v2(
     })
 }
 
+fn parse_long_text_options(
+    options: &indextts_long_text_options_t,
+) -> Result<LongTextConfig, String> {
+    validate_reserved(&options.reserved)?;
+    if options.max_chars == 0 {
+        return Err("max_chars must be greater than zero".into());
+    }
+    Ok(LongTextConfig {
+        max_chars: options.max_chars,
+        pause_ms: options.pause_ms,
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate_long_text_result_request(
+    model: indextts_model_t,
+    request: indextts_request_t,
+    voice: indextts_voice_t,
+    options: *const indextts_generate_options_t,
+    long_text_options: *const indextts_long_text_options_t,
+    out_result: *mut indextts_long_text_result_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null()
+            || request.is_null()
+            || voice.is_null()
+            || options.is_null()
+            || long_text_options.is_null()
+            || out_result.is_null()
+        {
+            return Err("invalid arguments".into());
+        }
+        *out_result = indextts_long_text_result_t::default();
+        if (&*request).model != model as usize {
+            return Err("request belongs to another model".into());
+        }
+        let (text, generation_config) = parse_generation_options(&*options)?;
+        let long_text_config = parse_long_text_options(&*long_text_options)?;
+        let model_ref = &*model;
+        begin_request(&*request)?;
+        let _active = ActiveRequestGuard::new(&model_ref.active_requests);
+        let result = model_ref
+            .pipeline
+            .synthesize_long_text_prepared_result_cancellable(
+                text,
+                &(&*voice).conditioning,
+                &generation_config,
+                &long_text_config,
+                &(&*request).cancelled,
+            )
+            .map_err(|error| error.to_string())?;
+        store_long_text_result(result, out_result)
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indextts_request_cancel(request: indextts_request_t) -> i32 {
     if request.is_null() {
@@ -1182,6 +1376,26 @@ pub unsafe extern "C" fn indextts_audio_free(audio: *mut indextts_audio_out_t) {
     });
 }
 #[no_mangle]
+pub unsafe extern "C" fn indextts_long_text_result_free(result: *mut indextts_long_text_result_t) {
+    ffi_void(|| {
+        if result.is_null() {
+            return;
+        }
+        let output = &mut *result;
+        indextts_audio_free(&mut output.audio);
+        if !output.normalized_text.is_null() {
+            drop(CString::from_raw(output.normalized_text));
+        }
+        if !output.segments.is_null() && output.segment_count != 0 {
+            let segments =
+                std::ptr::slice_from_raw_parts_mut(output.segments, output.segment_count);
+            drop(Box::from_raw(segments));
+        }
+        *output = indextts_long_text_result_t::default();
+    });
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn indextts_emotion_free(emotion: indextts_emotion_t) {
     ffi_void(|| {
         if !emotion.is_null() {
@@ -1230,14 +1444,18 @@ mod tests {
         let generation = indextts_generate_options_t::default();
         assert_eq!(generation.num_beams, 1);
         assert_eq!(generation.duration_factor, 1.0);
+        let long_text = indextts_long_text_options_t::default();
+        assert_eq!(long_text.max_chars, 200);
+        assert_eq!(long_text.pause_ms, 200);
+        assert!(parse_long_text_options(&long_text).is_ok());
     }
     #[test]
     fn abi_version_and_capabilities_are_truthful() {
-        assert_eq!(indextts_abi_version(), 0x0001_0004);
+        assert_eq!(indextts_abi_version(), 0x0001_0005);
         let mut capabilities = indextts_capabilities_t::default();
         assert_eq!(unsafe { indextts_get_capabilities(&mut capabilities) }, 0);
         assert_eq!(capabilities.abi_major, 1);
-        assert_eq!(capabilities.abi_minor, 4);
+        assert_eq!(capabilities.abi_minor, 5);
         assert_eq!(capabilities.sample_rate, 22_050);
         assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
         assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);
@@ -1248,6 +1466,43 @@ mod tests {
         let options = indextts_generate_options_v2_t::default();
         assert_eq!(options.emotion.mode, INDEXTTS_EMOTION_NONE);
         assert_eq!(options.emotion.strength, 1.0);
+    }
+
+    #[test]
+    fn long_text_options_reject_zero_and_reserved_values() {
+        let zero_max_chars = indextts_long_text_options_t {
+            max_chars: 0,
+            ..indextts_long_text_options_t::default()
+        };
+        assert_eq!(
+            parse_long_text_options(&zero_max_chars).unwrap_err(),
+            "max_chars must be greater than zero"
+        );
+        let reserved = indextts_long_text_options_t {
+            reserved: [1, 0, 0, 0],
+            ..indextts_long_text_options_t::default()
+        };
+        assert_eq!(
+            parse_long_text_options(&reserved).unwrap_err(),
+            "reserved fields must be zero"
+        );
+    }
+
+    #[test]
+    fn long_text_entry_rejects_null_arguments() {
+        assert_eq!(
+            unsafe {
+                indextts_generate_long_text_result_request(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
+            },
+            -1
+        );
     }
 
     #[test]
@@ -1333,6 +1588,44 @@ mod tests {
         assert_eq!(unsafe { indextts_model_cancel(pointer) }, 0);
         assert!(unsafe { &*pointer }.cancelled.load(Ordering::Acquire));
         unsafe { indextts_model_free(pointer) };
+    }
+
+    #[test]
+    fn long_text_result_free_reclaims_and_zeros() {
+        let mut samples = vec![1.0f32, 2.0].into_boxed_slice();
+        let mut segments = vec![indextts_long_text_segment_t {
+            start_char: 0,
+            end_char: 2,
+            semantic_token_count: 3,
+            audio_offset_samples: 0,
+            audio_duration_samples: 2,
+            seed: 7,
+            reserved: [0; 4],
+        }]
+        .into_boxed_slice();
+        let text = CString::new("测试").unwrap();
+        let mut result = indextts_long_text_result_t {
+            audio: indextts_audio_out_t {
+                samples: samples.as_mut_ptr(),
+                sample_count: samples.len(),
+                sample_rate: 22_050,
+                channels: 1,
+                reserved: [0; 4],
+            },
+            normalized_text: text.into_raw(),
+            normalized_text_length: 6,
+            segments: segments.as_mut_ptr(),
+            segment_count: segments.len(),
+            ..indextts_long_text_result_t::default()
+        };
+        std::mem::forget(samples);
+        std::mem::forget(segments);
+        unsafe { indextts_long_text_result_free(&mut result) };
+        assert!(result.audio.samples.is_null());
+        assert!(result.normalized_text.is_null());
+        assert!(result.segments.is_null());
+        assert_eq!(result.segment_count, 0);
+        unsafe { indextts_long_text_result_free(&mut result) };
     }
 
     #[test]

@@ -12,14 +12,14 @@ import (
 )
 
 func TestVersion(t *testing.T) {
-	if ABIVersion() != 0x00010004 {
+	if ABIVersion() != 0x00010005 {
 		t.Fatalf("unexpected ABI version %#x", ABIVersion())
 	}
 	capabilities, err := GetCapabilities()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 4 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
+	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 5 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
 		t.Fatalf("unexpected capabilities: %+v", capabilities)
 	}
 	if Version() == "" {
@@ -147,6 +147,27 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if vectorResult.Info.Peak <= 0 || vectorResult.Info.RMS <= 0 || vectorResult.Info.GeneratedSeconds <= 0 {
 		t.Fatalf("invalid audio diagnostics: %+v", vectorResult.Info)
+	}
+
+	longText, err := model.GenerateLongTextResult(
+		voice,
+		"第一段用于验证长文本。第二段用于验证分段元数据和音频拼接。",
+		Options{Language: "ZH", Seed: 1234, DurationFactor: 1},
+		LongTextOptions{MaxChars: 12, Pause: 100 * time.Millisecond},
+	)
+	if err != nil {
+		t.Fatalf("generate long text: %v", err)
+	}
+	if len(longText.Audio.Samples) == 0 || longText.NormalizedText == "" || len(longText.Segments) < 2 {
+		t.Fatalf("invalid long-text result: text=%q segments=%d samples=%d", longText.NormalizedText, len(longText.Segments), len(longText.Audio.Samples))
+	}
+	for index, segment := range longText.Segments {
+		if segment.StartChar >= segment.EndChar || segment.AudioDurationSamples == 0 || segment.SemanticTokens == 0 || segment.Seed != 1234+uint64(index) {
+			t.Fatalf("invalid long-text segment %d: %+v", index, segment)
+		}
+		if segment.AudioOffsetSamples+segment.AudioDurationSamples > len(longText.Audio.Samples) {
+			t.Fatalf("long-text segment %d exceeds audio", index)
+		}
 	}
 
 	audio, err := model.Generate(voice, "你好世界，这是一次Go端到端测试。", Options{

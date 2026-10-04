@@ -150,6 +150,32 @@ typedef struct {
     indextts_generation_info_t info;
 } indextts_generation_result_t;
 
+typedef struct {
+    size_t max_chars;
+    uint64_t pause_ms;
+    uint64_t reserved[4];
+} indextts_long_text_options_t;
+
+typedef struct {
+    size_t start_char;
+    size_t end_char;
+    uint32_t semantic_token_count;
+    size_t audio_offset_samples;
+    size_t audio_duration_samples;
+    uint64_t seed;
+    uint64_t reserved[4];
+} indextts_long_text_segment_t;
+
+typedef struct {
+    indextts_audio_out_t audio;
+    indextts_generation_info_t info;
+    char *normalized_text; /* UTF-8, NUL-terminated; length excludes NUL */
+    size_t normalized_text_length;
+    indextts_long_text_segment_t *segments;
+    size_t segment_count;
+    uint64_t reserved[4];
+} indextts_long_text_result_t;
+
 #define INDEXTTS_OK 0
 #define INDEXTTS_ERROR -1
 #define INDEXTTS_PANIC -2
@@ -163,6 +189,7 @@ INDEXTTS_API int32_t indextts_voice_get_info(indextts_voice_t voice, indextts_vo
 INDEXTTS_API void indextts_model_options_init(indextts_model_options_t *options);
 INDEXTTS_API void indextts_generate_options_init(indextts_generate_options_t *options);
 INDEXTTS_API void indextts_generate_options_v2_init(indextts_generate_options_v2_t *options);
+INDEXTTS_API void indextts_long_text_options_init(indextts_long_text_options_t *options);
 INDEXTTS_API int32_t indextts_model_load(const indextts_model_options_t *options, indextts_model_t *out_model);
 INDEXTTS_API int32_t indextts_voice_prepare(indextts_model_t model, const char *reference_audio_path, indextts_voice_t *out_voice);
 INDEXTTS_API int32_t indextts_voice_prepare_pcm(indextts_model_t model, const float *samples, size_t sample_count, uint32_t sample_rate, uint32_t channels, indextts_voice_t *out_voice);
@@ -173,11 +200,13 @@ INDEXTTS_API void indextts_emotion_free(indextts_emotion_t emotion);
 INDEXTTS_API int32_t indextts_request_create(indextts_model_t model, indextts_request_t *out_request);
 INDEXTTS_API int32_t indextts_generate_request_v2(indextts_model_t model, indextts_request_t request, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_audio_out_t *out_audio);
 INDEXTTS_API int32_t indextts_generate_result_request_v2(indextts_model_t model, indextts_request_t request, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_generation_result_t *out_result);
+INDEXTTS_API int32_t indextts_generate_long_text_result_request(indextts_model_t model, indextts_request_t request, indextts_voice_t voice, const indextts_generate_options_t *options, const indextts_long_text_options_t *long_text_options, indextts_long_text_result_t *out_result);
 INDEXTTS_API int32_t indextts_request_cancel(indextts_request_t request);
 INDEXTTS_API void indextts_request_free(indextts_request_t request);
 /* Thread-safe cooperative cancellation; returns immediately. */
 INDEXTTS_API int32_t indextts_model_cancel(indextts_model_t model);
 INDEXTTS_API void indextts_audio_free(indextts_audio_out_t *audio);
+INDEXTTS_API void indextts_long_text_result_free(indextts_long_text_result_t *result);
 INDEXTTS_API void indextts_voice_free(indextts_voice_t voice);
 INDEXTTS_API void indextts_model_free(indextts_model_t model);
 

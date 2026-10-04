@@ -34,6 +34,8 @@ func TestStubReportsNativeUnavailable(t *testing.T) {
 		{"generate V2 context", generateV2ContextError()},
 		{"generate V2 result", generateV2ResultError()},
 		{"generate V2 result context", generateV2ResultContextError()},
+		{"generate long text result", generateLongTextResultError()},
+		{"generate long text result context", generateLongTextResultContextError()},
 		{"cancel", (&Model{}).Cancel()},
 	}
 	for _, check := range checks {
@@ -106,5 +108,13 @@ func generateV2ResultError() error {
 }
 func generateV2ResultContextError() error {
 	_, err := (&Model{}).GenerateV2ResultContext(context.Background(), &Voice{}, "text", OptionsV2{})
+	return err
+}
+func generateLongTextResultError() error {
+	_, err := (&Model{}).GenerateLongTextResult(&Voice{}, "text", Options{}, LongTextOptions{})
+	return err
+}
+func generateLongTextResultContextError() error {
+	_, err := (&Model{}).GenerateLongTextResultContext(context.Background(), &Voice{}, "text", Options{}, LongTextOptions{})
 	return err
 }

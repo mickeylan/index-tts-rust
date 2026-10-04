@@ -60,4 +60,12 @@ func (m *Model) GenerateV2ResultContext(context.Context, *Voice, string, Options
 	return GenerationResult{}, ErrNativeUnavailable
 }
 
+func (m *Model) GenerateLongTextResult(*Voice, string, Options, LongTextOptions) (LongTextResult, error) {
+	return LongTextResult{}, ErrNativeUnavailable
+}
+
+func (m *Model) GenerateLongTextResultContext(context.Context, *Voice, string, Options, LongTextOptions) (LongTextResult, error) {
+	return LongTextResult{}, ErrNativeUnavailable
+}
+
 func Version() string { return "" }
