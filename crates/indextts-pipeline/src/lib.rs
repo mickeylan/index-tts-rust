@@ -12,7 +12,8 @@
 
 use candle_core::{Device, Tensor as CandleTensor};
 use indextts_audio::{
-    campplus_fbank, process_reference_audio, reference_mel, seamless_m4t_features,
+    campplus_fbank, process_reference_audio, process_reference_buffer, reference_mel,
+    seamless_m4t_features,
 };
 use indextts_core::{
     AudioBuffer, DeviceConfig, GenerationConfig, Language, ModelConfig, Result as TtsResult,
@@ -106,7 +107,20 @@ impl ReferenceEncoder {
 
     pub fn encode(&self, reference_audio: &Path) -> TtsResult<ReferenceConditioning> {
         let (audio_16k, audio_22k) = process_reference_audio(reference_audio)?;
-        let seamless = seamless_m4t_features(&audio_16k)?;
+        self.encode_processed(&audio_16k, &audio_22k)
+    }
+
+    pub fn encode_buffer(&self, audio: AudioBuffer) -> TtsResult<ReferenceConditioning> {
+        let (audio_16k, audio_22k) = process_reference_buffer(audio)?;
+        self.encode_processed(&audio_16k, &audio_22k)
+    }
+
+    fn encode_processed(
+        &self,
+        audio_16k: &AudioBuffer,
+        audio_22k: &AudioBuffer,
+    ) -> TtsResult<ReferenceConditioning> {
+        let seamless = seamless_m4t_features(audio_16k)?;
         let semantic = run_wav2vec2bert(
             &self.wav2vec,
             Tensor::new(
@@ -117,7 +131,7 @@ impl ReferenceEncoder {
         )?;
         let semantic = self.stats.normalize(semantic)?;
 
-        let fbank = campplus_fbank(&audio_16k)?;
+        let fbank = campplus_fbank(audio_16k)?;
         let fbank_frames = fbank.len() / 80;
         let speaker_style = run_campplus(
             &self.campplus,
@@ -133,7 +147,7 @@ impl ReferenceEncoder {
             .as_ref()
             .map(|session| run_emotion_conditioner(session, semantic.clone()))
             .transpose()?;
-        let mel = reference_mel(&audio_22k)?;
+        let mel = reference_mel(audio_22k)?;
         let mel_frames = mel.len() / 80;
         let reference_mel = Tensor::new(mel, vec![1, 80, mel_frames as i64]);
         let prompt_condition =
@@ -696,6 +710,18 @@ impl IndexTtsPipeline {
             )
         })?;
         runtime.reference.encode(reference_audio_path)
+    }
+
+    pub fn prepare_voice_buffer(&self, audio: AudioBuffer) -> TtsResult<ReferenceConditioning> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        runtime.reference.encode_buffer(audio)
     }
 
     pub fn prepare_emotion_reference(

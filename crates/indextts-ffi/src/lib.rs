@@ -4,7 +4,7 @@
 
 mod manifest;
 
-use indextts_audio::process_reference_audio;
+use indextts_audio::{process_reference_audio, process_reference_buffer};
 use indextts_core::{
     AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision,
 };
@@ -681,6 +681,82 @@ pub unsafe extern "C" fn indextts_voice_prepare(
             duration_seconds: processed.duration() as f32,
             source_sample_rate: spec.sample_rate,
             source_channels: spec.channels as u32,
+            cache_bytes: conditioning_bytes(&conditioning),
+        };
+        *out_voice = Box::into_raw(Box::new(IndexTtsVoiceHandle { conditioning, info }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_voice_prepare_pcm(
+    model: indextts_model_t,
+    samples: *const f32,
+    sample_count: usize,
+    sample_rate: u32,
+    channels: u32,
+    out_voice: *mut indextts_voice_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || samples.is_null() || sample_count == 0 || out_voice.is_null() {
+            return Err("invalid arguments".into());
+        }
+        if sample_rate == 0 || channels == 0 || sample_count % channels as usize != 0 {
+            return Err("invalid PCM shape or sample rate".into());
+        }
+        *out_voice = std::ptr::null_mut();
+        let interleaved = std::slice::from_raw_parts(samples, sample_count);
+        if interleaved.iter().any(|sample| !sample.is_finite()) {
+            return Err("PCM contains a non-finite sample".into());
+        }
+        let mono: Vec<f32> = interleaved
+            .chunks_exact(channels as usize)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect();
+        let hash_bytes = unsafe {
+            std::slice::from_raw_parts(
+                samples.cast::<u8>(),
+                sample_count * std::mem::size_of::<f32>(),
+            )
+        };
+        let mut digest = Sha256::new();
+        digest.update(sample_rate.to_le_bytes());
+        digest.update(channels.to_le_bytes());
+        digest.update(hash_bytes);
+        let reference_sha256 = format!("{:x}", digest.finalize());
+        let source = AudioBuffer::new(mono, sample_rate);
+        let (_, processed) =
+            process_reference_buffer(source.clone()).map_err(|error| error.to_string())?;
+        let model = &*model;
+        let conditioning = {
+            let mut cache = model
+                .voice_cache
+                .lock()
+                .map_err(|_| "voice cache lock was poisoned")?;
+            cache.get(&reference_sha256)
+        };
+        let conditioning = match conditioning {
+            Some(value) => value,
+            None => {
+                let value = Arc::new(
+                    model
+                        .pipeline
+                        .prepare_voice_buffer(source)
+                        .map_err(|error| error.to_string())?,
+                );
+                let mut cache = model
+                    .voice_cache
+                    .lock()
+                    .map_err(|_| "voice cache lock was poisoned")?;
+                cache.insert(reference_sha256.clone(), value.clone());
+                value
+            }
+        };
+        let info = VoiceInfo {
+            reference_sha256,
+            duration_seconds: processed.duration() as f32,
+            source_sample_rate: sample_rate,
+            source_channels: channels,
             cache_bytes: conditioning_bytes(&conditioning),
         };
         *out_voice = Box::into_raw(Box::new(IndexTtsVoiceHandle { conditioning, info }));

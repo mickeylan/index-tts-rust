@@ -129,8 +129,11 @@ fn read_wav(path: &Path) -> Result<AudioBuffer> {
 
 /// Process reference audio for IndexTTS
 pub fn process_reference_audio(path: &Path) -> Result<(AudioBuffer, AudioBuffer)> {
-    let mut audio = read_audio(path)?;
+    process_reference_buffer(read_audio(path)?)
+}
 
+/// Validate, truncate, and resample an in-memory mono reference waveform.
+pub fn process_reference_buffer(mut audio: AudioBuffer) -> Result<(AudioBuffer, AudioBuffer)> {
     // Check minimum duration
     let min_samples = (MIN_REFERENCE_DURATION * audio.sample_rate as f64) as usize;
     if audio.samples.len() < min_samples {

@@ -192,6 +192,37 @@ type Voice struct {
 	h     C.indextts_voice_t
 }
 
+func (m *Model) PrepareVoicePCM(samples []float32, sampleRate, channels uint32) (*Voice, error) {
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
+	if m.h == nil {
+		return nil, errors.New("IndexTTS model is closed")
+	}
+	if len(samples) == 0 || sampleRate == 0 || channels == 0 || len(samples)%int(channels) != 0 {
+		return nil, errors.New("invalid PCM samples, sample rate, or channel count")
+	}
+	memory := C.malloc(C.size_t(len(samples)) * C.size_t(unsafe.Sizeof(C.float(0))))
+	if memory == nil {
+		return nil, errors.New("failed to allocate native PCM buffer")
+	}
+	defer C.free(memory)
+	copy(unsafe.Slice((*float32)(memory), len(samples)), samples)
+	var handle C.indextts_voice_t
+	nativeMu.Lock()
+	status := C.indextts_voice_prepare_pcm(m.h, (*C.float)(memory), C.size_t(len(samples)), C.uint32_t(sampleRate), C.uint32_t(channels), &handle)
+	if status != C.INDEXTTS_OK {
+		err := nativeError()
+		nativeMu.Unlock()
+		return nil, err
+	}
+	nativeMu.Unlock()
+	voice := &Voice{model: m, h: handle}
+	runtime.SetFinalizer(voice, (*Voice).Close)
+	return voice, nil
+}
+
 func (m *Model) PrepareVoice(path string) (*Voice, error) {
 	m.life.RLock()
 	defer m.life.RUnlock()

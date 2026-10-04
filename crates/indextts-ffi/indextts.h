@@ -165,6 +165,7 @@ INDEXTTS_API void indextts_generate_options_init(indextts_generate_options_t *op
 INDEXTTS_API void indextts_generate_options_v2_init(indextts_generate_options_v2_t *options);
 INDEXTTS_API int32_t indextts_model_load(const indextts_model_options_t *options, indextts_model_t *out_model);
 INDEXTTS_API int32_t indextts_voice_prepare(indextts_model_t model, const char *reference_audio_path, indextts_voice_t *out_voice);
+INDEXTTS_API int32_t indextts_voice_prepare_pcm(indextts_model_t model, const float *samples, size_t sample_count, uint32_t sample_rate, uint32_t channels, indextts_voice_t *out_voice);
 INDEXTTS_API int32_t indextts_generate(indextts_model_t model, indextts_voice_t voice, const indextts_generate_options_t *options, indextts_audio_out_t *out_audio);
 INDEXTTS_API int32_t indextts_emotion_prepare_reference(indextts_model_t model, const char *reference_audio_path, indextts_emotion_t *out_emotion);
 INDEXTTS_API int32_t indextts_generate_v2(indextts_model_t model, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_audio_out_t *out_audio);
