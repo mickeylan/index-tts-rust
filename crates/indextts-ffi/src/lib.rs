@@ -294,7 +294,7 @@ impl Default for indextts_voice_info_t {
 }
 
 const ABI_MAJOR: u32 = 1;
-const ABI_MINOR: u32 = 2;
+const ABI_MINOR: u32 = 3;
 
 static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
@@ -1070,11 +1070,11 @@ mod tests {
     }
     #[test]
     fn abi_version_and_capabilities_are_truthful() {
-        assert_eq!(indextts_abi_version(), 0x0001_0002);
+        assert_eq!(indextts_abi_version(), 0x0001_0003);
         let mut capabilities = indextts_capabilities_t::default();
         assert_eq!(unsafe { indextts_get_capabilities(&mut capabilities) }, 0);
         assert_eq!(capabilities.abi_major, 1);
-        assert_eq!(capabilities.abi_minor, 2);
+        assert_eq!(capabilities.abi_minor, 3);
         assert_eq!(capabilities.sample_rate, 22_050);
         assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
         assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);

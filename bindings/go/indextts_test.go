@@ -10,14 +10,14 @@ import (
 )
 
 func TestVersion(t *testing.T) {
-	if ABIVersion() != 0x00010002 {
+	if ABIVersion() != 0x00010003 {
 		t.Fatalf("unexpected ABI version %#x", ABIVersion())
 	}
 	capabilities, err := GetCapabilities()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 2 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
+	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 3 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
 		t.Fatalf("unexpected capabilities: %+v", capabilities)
 	}
 	if Version() == "" {
