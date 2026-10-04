@@ -1269,9 +1269,7 @@ dependencies = [
  "indextts-pipeline",
  "libc",
  "once_cell",
- "serde_json",
  "sha2",
- "tempfile",
  "thiserror 2.0.21",
 ]
 
@@ -1322,6 +1320,8 @@ dependencies = [
  "indextts-text",
  "indextts-tokenizer",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

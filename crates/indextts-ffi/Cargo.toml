@@ -23,15 +23,11 @@ indextts-core = { workspace = true }
 indextts-pipeline = { workspace = true }
 indextts-audio = { workspace = true }
 once_cell = { workspace = true }
-serde_json = { workspace = true }
 sha2 = { workspace = true }
 hound = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [build-dependencies]
 cbindgen = "0.27"

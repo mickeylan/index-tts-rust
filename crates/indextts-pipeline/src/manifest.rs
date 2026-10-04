@@ -29,7 +29,7 @@ const REQUIRED_FILES: &[&str] = &[
     "onnx/bigvgan/model-512.onnx",
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ValidatedManifest {
     pub model: String,
     pub sha256: String,

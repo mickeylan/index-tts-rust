@@ -9,6 +9,9 @@
 //! ```
 //!
 
+mod manifest;
+pub use manifest::{validate_model_manifest, ValidatedManifest};
+
 use candle_core::{Device, Tensor as CandleTensor};
 use indextts_audio::{
     campplus_fbank, process_reference_audio, process_reference_buffer, reference_mel,
@@ -885,6 +888,7 @@ fn concatenate_long_text(
 pub struct IndexTtsPipeline {
     config: ModelConfig,
     runtime: Option<Mutex<SemanticRuntime>>,
+    manifest: Option<ValidatedManifest>,
 }
 
 impl IndexTtsPipeline {
@@ -893,6 +897,7 @@ impl IndexTtsPipeline {
         Self {
             config,
             runtime: None,
+            manifest: None,
         }
     }
 
@@ -903,10 +908,13 @@ impl IndexTtsPipeline {
             "Loading IndexTTS-2.5 models from {:?}",
             self.config.model_dir
         );
+        let manifest = validate_model_manifest(&self.config.model_dir)
+            .map_err(indextts_core::IndexTtsError::InvalidModel)?;
         self.runtime = Some(Mutex::new(SemanticRuntime::load_with_device(
             &self.config.model_dir,
             self.config.device,
         )?));
+        self.manifest = Some(manifest);
         info!("Model loading complete");
         Ok(())
     }
@@ -1372,6 +1380,10 @@ impl IndexTtsPipeline {
             return Err(indextts_core::IndexTtsError::Cancelled);
         }
         runtime.vocode(&mel)
+    }
+
+    pub fn validated_manifest(&self) -> Option<&ValidatedManifest> {
+        self.manifest.as_ref()
     }
 
     /// Check if models are loaded

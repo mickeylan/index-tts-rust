@@ -2,8 +2,6 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
-mod manifest;
-
 use indextts_audio::{process_reference_audio, process_reference_buffer};
 use indextts_core::{
     AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision,
@@ -11,6 +9,7 @@ use indextts_core::{
 use indextts_pipeline::{
     GenerationDiagnostics, IndexTtsPipeline, LongTextConfig, LongTextSegment,
     LongTextSynthesisResult, PreparedEmotion, ReferenceConditioning, SynthesisResult,
+    ValidatedManifest,
 };
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -479,7 +478,7 @@ fn conditioning_bytes(conditioning: &ReferenceConditioning) -> u64 {
     .sum()
 }
 
-fn load_model_info(device: DeviceConfig, manifest: manifest::ValidatedManifest) -> ModelInfo {
+fn load_model_info(device: DeviceConfig, manifest: ValidatedManifest) -> ModelInfo {
     ModelInfo {
         model_version: manifest.model,
         manifest_sha256: manifest.sha256,
@@ -683,8 +682,6 @@ pub unsafe extern "C" fn indextts_model_load(
             }
         };
         let model_dir = PathBuf::from(model_dir);
-        let manifest = manifest::validate_model_manifest(&model_dir)?;
-        let info = load_model_info(device, manifest);
         let config = ModelConfig {
             model_dir,
             device,
@@ -692,6 +689,11 @@ pub unsafe extern "C" fn indextts_model_load(
         };
         let mut pipeline = IndexTtsPipeline::new(config);
         pipeline.load().map_err(|error| error.to_string())?;
+        let manifest = pipeline
+            .validated_manifest()
+            .cloned()
+            .ok_or_else(|| "pipeline loaded without a validated model manifest".to_string())?;
+        let info = load_model_info(device, manifest);
         *out_model = Box::into_raw(Box::new(IndexTtsModelHandle {
             pipeline,
             cancelled: Arc::new(AtomicBool::new(false)),
