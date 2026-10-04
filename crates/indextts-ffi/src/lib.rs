@@ -28,7 +28,9 @@ pub struct IndexTtsModelHandle {
     cancelled: Arc<AtomicBool>,
     info: ModelInfo,
     voice_cache: Mutex<VoiceCache>,
+    generation_lock: Mutex<()>,
     active_requests: AtomicU64,
+    queued_requests: AtomicU64,
 }
 pub struct IndexTtsVoiceHandle {
     conditioning: Arc<ReferenceConditioning>,
@@ -571,7 +573,7 @@ pub unsafe extern "C" fn indextts_model_health(
         output.voice_cache_entries = cache.entries.len() as u64;
         output.voice_cache_bytes = cache.total_bytes();
         output.active_requests = model.active_requests.load(Ordering::Acquire);
-        output.queued_requests = 0;
+        output.queued_requests = model.queued_requests.load(Ordering::Acquire);
         *health = output;
         Ok(())
     })
@@ -694,7 +696,9 @@ pub unsafe extern "C" fn indextts_model_load(
             cancelled: Arc::new(AtomicBool::new(false)),
             info,
             voice_cache: Mutex::new(VoiceCache::default()),
+            generation_lock: Mutex::new(()),
             active_requests: AtomicU64::new(0),
+            queued_requests: AtomicU64::new(0),
         }));
         Ok(())
     })
@@ -1010,8 +1014,9 @@ pub unsafe extern "C" fn indextts_generate(
         *out_audio = indextts_audio_out_t::default();
         let (text, config) = parse_generation_options(&*options)?;
         let model = &*model;
-        let _active = ActiveRequestGuard::new(&model.active_requests);
         model.cancelled.store(false, Ordering::Release);
+        let _generation = acquire_generation(model, &model.cancelled)?;
+        let _active = ActiveRequestGuard::new(&model.active_requests);
         let audio = model
             .pipeline
             .synthesize_prepared_cancellable(
@@ -1024,6 +1029,49 @@ pub unsafe extern "C" fn indextts_generate(
         store_audio(audio, out_audio);
         Ok(())
     })
+}
+
+struct CounterGuard<'a>(&'a AtomicU64);
+
+impl<'a> CounterGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for CounterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_generation<'a>(
+    model: &'a IndexTtsModelHandle,
+    cancelled: &AtomicBool,
+) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+    match model.generation_lock.try_lock() {
+        Ok(guard) => return Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err("model generation lock was poisoned".into())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    let _queued = CounterGuard::new(&model.queued_requests);
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled.to_string());
+        }
+        match model.generation_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("model generation lock was poisoned".into())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
 }
 
 struct ActiveRequestGuard<'a>(&'a AtomicU64);
@@ -1166,8 +1214,9 @@ pub unsafe extern "C" fn indextts_generate_v2(
         }
         *out_audio = indextts_audio_out_t::default();
         let model = &*model;
-        let _active = ActiveRequestGuard::new(&model.active_requests);
         model.cancelled.store(false, Ordering::Release);
+        let _generation = acquire_generation(model, &model.cancelled)?;
+        let _active = ActiveRequestGuard::new(&model.active_requests);
         let audio = generate_v2_inner(model, &*voice, &*options, &model.cancelled)?;
         store_audio(audio, out_audio);
         Ok(())
@@ -1226,6 +1275,7 @@ pub unsafe extern "C" fn indextts_generate_request_v2(
         *out_audio = indextts_audio_out_t::default();
         let model_ref = &*model;
         begin_request(&*request)?;
+        let _generation = acquire_generation(model_ref, &(&*request).cancelled)?;
         let _active = ActiveRequestGuard::new(&model_ref.active_requests);
         let audio = generate_v2_inner(model_ref, &*voice, &*options, &(&*request).cancelled)?;
         store_audio(audio, out_audio);
@@ -1256,6 +1306,7 @@ pub unsafe extern "C" fn indextts_generate_result_request_v2(
         *out_result = indextts_generation_result_t::default();
         let model_ref = &*model;
         begin_request(&*request)?;
+        let _generation = acquire_generation(model_ref, &(&*request).cancelled)?;
         let _active = ActiveRequestGuard::new(&model_ref.active_requests);
         let result =
             generate_result_v2_inner(model_ref, &*voice, &*options, &(&*request).cancelled)?;
@@ -1305,6 +1356,7 @@ pub unsafe extern "C" fn indextts_generate_long_text_result_request(
         let long_text_config = parse_long_text_options(&*long_text_options)?;
         let model_ref = &*model;
         begin_request(&*request)?;
+        let _generation = acquire_generation(model_ref, &(&*request).cancelled)?;
         let _active = ActiveRequestGuard::new(&model_ref.active_requests);
         let result = model_ref
             .pipeline
@@ -1582,12 +1634,44 @@ mod tests {
                 device: "cpu".into(),
             },
             voice_cache: Mutex::new(VoiceCache::default()),
+            generation_lock: Mutex::new(()),
             active_requests: AtomicU64::new(0),
+            queued_requests: AtomicU64::new(0),
         });
         let pointer = Box::into_raw(handle);
         assert_eq!(unsafe { indextts_model_cancel(pointer) }, 0);
         assert!(unsafe { &*pointer }.cancelled.load(Ordering::Acquire));
         unsafe { indextts_model_free(pointer) };
+    }
+
+    #[test]
+    fn queued_generation_is_counted_and_cancellable() {
+        let model = IndexTtsModelHandle {
+            pipeline: IndexTtsPipeline::new(ModelConfig::default()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            info: ModelInfo {
+                model_version: String::new(),
+                manifest_sha256: String::new(),
+                device: "cpu".into(),
+            },
+            voice_cache: Mutex::new(VoiceCache::default()),
+            generation_lock: Mutex::new(()),
+            active_requests: AtomicU64::new(0),
+            queued_requests: AtomicU64::new(0),
+        };
+        let held = model.generation_lock.lock().unwrap();
+        let cancelled = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| acquire_generation(&model, &cancelled).unwrap_err());
+            while model.queued_requests.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
+            assert_eq!(model.active_requests.load(Ordering::Acquire), 0);
+            cancelled.store(true, Ordering::Release);
+            assert_eq!(waiter.join().unwrap(), "Generation cancelled");
+        });
+        drop(held);
+        assert_eq!(model.queued_requests.load(Ordering::Acquire), 0);
     }
 
     #[test]
