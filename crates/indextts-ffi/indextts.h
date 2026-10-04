@@ -20,8 +20,10 @@ extern "C" {
 
 struct IndexTtsModelHandle;
 struct IndexTtsVoiceHandle;
+struct IndexTtsEmotionHandle;
 typedef struct IndexTtsModelHandle *indextts_model_t;
 typedef struct IndexTtsVoiceHandle *indextts_voice_t;
+typedef struct IndexTtsEmotionHandle *indextts_emotion_t;
 
 typedef struct {
     const char *model_dir;
@@ -43,6 +45,29 @@ typedef struct {
     float repetition_penalty;
     uint64_t reserved[4];
 } indextts_generate_options_t;
+
+typedef enum {
+    INDEXTTS_EMOTION_NONE = 0,
+    INDEXTTS_EMOTION_TEXT = 1,
+    INDEXTTS_EMOTION_REFERENCE = 2,
+    INDEXTTS_EMOTION_VECTOR = 3
+} indextts_emotion_mode_t;
+
+typedef struct {
+    int32_t mode;
+    const char *text;
+    indextts_emotion_t reference;
+    const float *vector;
+    size_t vector_length;
+    float strength;
+    uint64_t reserved[4];
+} indextts_emotion_options_t;
+
+typedef struct {
+    indextts_generate_options_t base;
+    indextts_emotion_options_t emotion;
+    uint64_t reserved[4];
+} indextts_generate_options_v2_t;
 
 typedef struct {
     uint32_t abi_major;
@@ -102,9 +127,13 @@ INDEXTTS_API int32_t indextts_model_get_info(indextts_model_t model, indextts_mo
 INDEXTTS_API int32_t indextts_voice_get_info(indextts_voice_t voice, indextts_voice_info_t *info);
 INDEXTTS_API void indextts_model_options_init(indextts_model_options_t *options);
 INDEXTTS_API void indextts_generate_options_init(indextts_generate_options_t *options);
+INDEXTTS_API void indextts_generate_options_v2_init(indextts_generate_options_v2_t *options);
 INDEXTTS_API int32_t indextts_model_load(const indextts_model_options_t *options, indextts_model_t *out_model);
 INDEXTTS_API int32_t indextts_voice_prepare(indextts_model_t model, const char *reference_audio_path, indextts_voice_t *out_voice);
 INDEXTTS_API int32_t indextts_generate(indextts_model_t model, indextts_voice_t voice, const indextts_generate_options_t *options, indextts_audio_out_t *out_audio);
+INDEXTTS_API int32_t indextts_emotion_prepare_reference(indextts_model_t model, const char *reference_audio_path, indextts_emotion_t *out_emotion);
+INDEXTTS_API int32_t indextts_generate_v2(indextts_model_t model, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_audio_out_t *out_audio);
+INDEXTTS_API void indextts_emotion_free(indextts_emotion_t emotion);
 /* Thread-safe cooperative cancellation; returns immediately. */
 INDEXTTS_API int32_t indextts_model_cancel(indextts_model_t model);
 INDEXTTS_API void indextts_audio_free(indextts_audio_out_t *audio);

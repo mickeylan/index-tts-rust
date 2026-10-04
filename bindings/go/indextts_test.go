@@ -10,14 +10,14 @@ import (
 )
 
 func TestVersion(t *testing.T) {
-	if ABIVersion() != 0x00010000 {
+	if ABIVersion() != 0x00010001 {
 		t.Fatalf("unexpected ABI version %#x", ABIVersion())
 	}
 	capabilities, err := GetCapabilities()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.ABIMajor != 1 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU {
+	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 1 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
 		t.Fatalf("unexpected capabilities: %+v", capabilities)
 	}
 	if Version() == "" {
@@ -106,6 +106,22 @@ func TestEndToEnd(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("cancellation did not stop generation within 30 seconds")
+	}
+
+	emotion, err := model.PrepareEmotionReference(voicePath)
+	if err != nil {
+		t.Fatalf("prepare emotion reference: %v", err)
+	}
+	defer emotion.Close()
+	v2Audio, err := model.GenerateV2(voice, "你好世界，这是一次Go情感参考测试。", OptionsV2{
+		Options: Options{Language: "ZH", Seed: 1234, DurationFactor: 1},
+		Emotion: EmotionOptions{Mode: EmotionReference, Reference: emotion, Strength: 1},
+	})
+	if err != nil {
+		t.Fatalf("generate v2: %v", err)
+	}
+	if len(v2Audio.Samples) == 0 || v2Audio.SampleRate != 22_050 {
+		t.Fatalf("invalid V2 audio: rate=%d samples=%d", v2Audio.SampleRate, len(v2Audio.Samples))
 	}
 
 	audio, err := model.Generate(voice, "你好世界，这是一次Go端到端测试。", Options{

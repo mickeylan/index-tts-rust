@@ -229,6 +229,68 @@ type Audio struct {
 	Channels   uint32
 }
 
+type EmotionMode int32
+
+const (
+	EmotionNone EmotionMode = iota
+	EmotionText
+	EmotionReference
+	EmotionVector
+)
+
+type Emotion struct {
+	mu    sync.Mutex
+	model *Model
+	h     C.indextts_emotion_t
+}
+
+type EmotionOptions struct {
+	Mode      EmotionMode
+	Text      string
+	Reference *Emotion
+	Vector    []float32
+	Strength  float32
+}
+
+type OptionsV2 struct {
+	Options
+	Emotion EmotionOptions
+}
+
+func (m *Model) PrepareEmotionReference(path string) (*Emotion, error) {
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
+	if m.h == nil {
+		return nil, errors.New("IndexTTS model is closed")
+	}
+	value := C.CString(path)
+	defer C.free(unsafe.Pointer(value))
+	var handle C.indextts_emotion_t
+	nativeMu.Lock()
+	status := C.indextts_emotion_prepare_reference(m.h, value, &handle)
+	if status != C.INDEXTTS_OK {
+		err := nativeError()
+		nativeMu.Unlock()
+		return nil, err
+	}
+	nativeMu.Unlock()
+	emotion := &Emotion{model: m, h: handle}
+	runtime.SetFinalizer(emotion, (*Emotion).Close)
+	return emotion, nil
+}
+
+func (e *Emotion) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.h != nil {
+		C.indextts_emotion_free(e.h)
+		e.h = nil
+	}
+	return nil
+}
+
 func (m *Model) Generate(v *Voice, text string, options Options) (Audio, error) {
 	return m.GenerateContext(context.Background(), v, text, options)
 }
@@ -314,6 +376,98 @@ func (m *Model) GenerateContext(ctx context.Context, v *Voice, text string, opti
 	nativeSamples := unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)
 	floats := append([]float32(nil), nativeSamples...)
 	runtime.KeepAlive(v)
+	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
+}
+
+func (m *Model) GenerateV2(v *Voice, text string, options OptionsV2) (Audio, error) {
+	return m.GenerateV2Context(context.Background(), v, text, options)
+}
+
+func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, options OptionsV2) (Audio, error) {
+	if ctx == nil {
+		return Audio{}, errors.New("context is nil")
+	}
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
+	if v == nil {
+		return Audio{}, errors.New("model or voice is closed")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if m.h == nil || v.h == nil || v.model != m {
+		return Audio{}, errors.New("model or voice is closed or mismatched")
+	}
+	if options.Language == "" {
+		options.Language = "ZH"
+	}
+	if options.DurationFactor == 0 {
+		options.DurationFactor = 1
+	}
+	ctext, clang := C.CString(text), C.CString(options.Language)
+	defer C.free(unsafe.Pointer(ctext))
+	defer C.free(unsafe.Pointer(clang))
+	var config C.indextts_generate_options_v2_t
+	C.indextts_generate_options_v2_init(&config)
+	config.base.text, config.base.language = ctext, clang
+	config.base.seed, config.base.duration_factor = C.uint64_t(options.Seed), C.float(options.DurationFactor)
+	config.emotion.mode = C.int32_t(options.Emotion.Mode)
+	config.emotion.strength = C.float(options.Emotion.Strength)
+	var emotion *Emotion
+	if options.Emotion.Mode == EmotionReference {
+		emotion = options.Emotion.Reference
+		if emotion == nil {
+			return Audio{}, errors.New("emotion reference is required")
+		}
+		emotion.mu.Lock()
+		defer emotion.mu.Unlock()
+		if emotion.h == nil || emotion.model != m {
+			return Audio{}, errors.New("emotion is closed or belongs to another model")
+		}
+		config.emotion.reference = emotion.h
+	} else if options.Emotion.Mode == EmotionText || options.Emotion.Mode == EmotionVector {
+		return Audio{}, errors.New("emotion text/vector is not supported by this runtime")
+	}
+	if err := ctx.Err(); err != nil {
+		return Audio{}, err
+	}
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = m.Cancel()
+		case <-done:
+		}
+	}()
+	var output C.indextts_audio_out_t
+	nativeMu.Lock()
+	status := C.indextts_generate_v2(m.h, v.h, &config, &output)
+	var nativeErr error
+	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
+		nativeErr = nativeError()
+	}
+	nativeMu.Unlock()
+	close(done)
+	<-stopped
+	if status == C.INDEXTTS_CANCELLED {
+		if err := ctx.Err(); err != nil {
+			return Audio{}, err
+		}
+		return Audio{}, ErrCancelled
+	}
+	if status != C.INDEXTTS_OK {
+		return Audio{}, nativeErr
+	}
+	defer C.indextts_audio_free(&output)
+	count := int(output.sample_count)
+	if count < 0 || C.size_t(count) != output.sample_count {
+		return Audio{}, errors.New("native audio is too large for this Go process")
+	}
+	floats := append([]float32(nil), unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)...)
+	runtime.KeepAlive(v)
+	runtime.KeepAlive(emotion)
 	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
 }
 

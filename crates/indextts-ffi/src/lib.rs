@@ -4,7 +4,7 @@
 
 use indextts_audio::process_reference_audio;
 use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};
-use indextts_pipeline::{IndexTtsPipeline, ReferenceConditioning};
+use indextts_pipeline::{IndexTtsPipeline, PreparedEmotion, ReferenceConditioning};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -66,8 +66,13 @@ impl VoiceCache {
         }
     }
 }
+pub struct IndexTtsEmotionHandle {
+    emotion: PreparedEmotion,
+}
+
 pub type indextts_model_t = *mut IndexTtsModelHandle;
 pub type indextts_voice_t = *mut IndexTtsVoiceHandle;
+pub type indextts_emotion_t = *mut IndexTtsEmotionHandle;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +125,45 @@ impl Default for indextts_generate_options_t {
             reserved: [0; 4],
         }
     }
+}
+
+pub const INDEXTTS_EMOTION_NONE: i32 = 0;
+pub const INDEXTTS_EMOTION_TEXT: i32 = 1;
+pub const INDEXTTS_EMOTION_REFERENCE: i32 = 2;
+pub const INDEXTTS_EMOTION_VECTOR: i32 = 3;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct indextts_emotion_options_t {
+    pub mode: i32,
+    pub text: *const libc::c_char,
+    pub reference: indextts_emotion_t,
+    pub vector: *const f32,
+    pub vector_length: usize,
+    pub strength: f32,
+    pub reserved: [u64; 4],
+}
+
+impl Default for indextts_emotion_options_t {
+    fn default() -> Self {
+        Self {
+            mode: INDEXTTS_EMOTION_NONE,
+            text: std::ptr::null(),
+            reference: std::ptr::null_mut(),
+            vector: std::ptr::null(),
+            vector_length: 0,
+            strength: 1.0,
+            reserved: [0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct indextts_generate_options_v2_t {
+    pub base: indextts_generate_options_t,
+    pub emotion: indextts_emotion_options_t,
+    pub reserved: [u64; 4],
 }
 
 #[repr(C)]
@@ -215,7 +259,7 @@ impl Default for indextts_voice_info_t {
 }
 
 const ABI_MAJOR: u32 = 1;
-const ABI_MINOR: u32 = 0;
+const ABI_MINOR: u32 = 1;
 
 static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
@@ -357,7 +401,7 @@ pub unsafe extern "C" fn indextts_get_capabilities(
             supports_request_cancellation: 0,
             supports_voice_cache: 1,
             supports_emotion_text: 0,
-            supports_emotion_reference: 0,
+            supports_emotion_reference: 1,
             supports_emotion_vector: 0,
             supports_target_duration: 0,
             supports_sampling: 0,
@@ -426,6 +470,17 @@ pub unsafe extern "C" fn indextts_generate_options_init(options: *mut indextts_g
     ffi_void(|| {
         if !options.is_null() {
             *options = indextts_generate_options_t::default();
+        }
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate_options_v2_init(
+    options: *mut indextts_generate_options_v2_t,
+) {
+    ffi_void(|| {
+        if !options.is_null() {
+            *options = indextts_generate_options_v2_t::default();
         }
     });
 }
@@ -546,41 +601,54 @@ pub unsafe extern "C" fn indextts_voice_prepare(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn indextts_generate(
+pub unsafe extern "C" fn indextts_emotion_prepare_reference(
     model: indextts_model_t,
-    voice: indextts_voice_t,
-    options: *const indextts_generate_options_t,
-    out_audio: *mut indextts_audio_out_t,
+    reference_audio_path: *const libc::c_char,
+    out_emotion: *mut indextts_emotion_t,
 ) -> i32 {
     ffi_status(|| {
-        if model.is_null() || voice.is_null() || options.is_null() || out_audio.is_null() {
+        if model.is_null() || reference_audio_path.is_null() || out_emotion.is_null() {
             return Err("invalid arguments".into());
         }
-        *out_audio = indextts_audio_out_t::default();
-        let options = &*options;
-        validate_reserved(&options.reserved)?;
-        let text = required_utf8(options.text, "text")?;
-        let language = if options.language.is_null() {
-            "ZH"
-        } else {
-            required_utf8(options.language, "language")?
-        };
-        let language =
-            Language::parse(language).ok_or_else(|| format!("unsupported language {language}"))?;
-        if options.do_sample != 0 || options.num_beams != 1 {
-            return Err("this build supports greedy generation only".into());
-        }
-        if !(0.5..=2.0).contains(&options.duration_factor) || !options.duration_factor.is_finite() {
-            return Err("duration_factor must be finite and in [0.5, 2.0]".into());
-        }
-        if !options.temperature.is_finite()
-            || !options.top_p.is_finite()
-            || !options.repetition_penalty.is_finite()
-            || options.top_k < 0
-        {
-            return Err("invalid generation option".into());
-        }
-        let config = GenerationConfig {
+        *out_emotion = std::ptr::null_mut();
+        let path = PathBuf::from(required_utf8(reference_audio_path, "reference_audio_path")?);
+        let emotion = (&*model)
+            .pipeline
+            .prepare_emotion_reference(&path)
+            .map_err(|error| error.to_string())?;
+        *out_emotion = Box::into_raw(Box::new(IndexTtsEmotionHandle { emotion }));
+        Ok(())
+    })
+}
+
+unsafe fn parse_generation_options(
+    options: &indextts_generate_options_t,
+) -> Result<(&str, GenerationConfig), String> {
+    validate_reserved(&options.reserved)?;
+    let text = required_utf8(options.text, "text")?;
+    let language = if options.language.is_null() {
+        "ZH"
+    } else {
+        required_utf8(options.language, "language")?
+    };
+    let language =
+        Language::parse(language).ok_or_else(|| format!("unsupported language {language}"))?;
+    if options.do_sample != 0 || options.num_beams != 1 {
+        return Err("this build supports greedy generation only".into());
+    }
+    if !(0.5..=2.0).contains(&options.duration_factor) || !options.duration_factor.is_finite() {
+        return Err("duration_factor must be finite and in [0.5, 2.0]".into());
+    }
+    if !options.temperature.is_finite()
+        || !options.top_p.is_finite()
+        || !options.repetition_penalty.is_finite()
+        || options.top_k < 0
+    {
+        return Err("invalid generation option".into());
+    }
+    Ok((
+        text,
+        GenerationConfig {
             text: text.into(),
             language,
             seed: options.seed,
@@ -592,7 +660,35 @@ pub unsafe extern "C" fn indextts_generate(
             top_p: options.top_p,
             repetition_penalty: options.repetition_penalty,
             max_length: None,
-        };
+        },
+    ))
+}
+
+unsafe fn store_audio(audio: indextts_core::AudioBuffer, out_audio: *mut indextts_audio_out_t) {
+    let mut samples = audio.samples.into_boxed_slice();
+    *out_audio = indextts_audio_out_t {
+        samples: samples.as_mut_ptr(),
+        sample_count: samples.len(),
+        sample_rate: audio.sample_rate,
+        channels: audio.channels as u32,
+        reserved: [0; 4],
+    };
+    std::mem::forget(samples);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate(
+    model: indextts_model_t,
+    voice: indextts_voice_t,
+    options: *const indextts_generate_options_t,
+    out_audio: *mut indextts_audio_out_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || voice.is_null() || options.is_null() || out_audio.is_null() {
+            return Err("invalid arguments".into());
+        }
+        *out_audio = indextts_audio_out_t::default();
+        let (text, config) = parse_generation_options(&*options)?;
         let model = &*model;
         model.cancelled.store(false, Ordering::Release);
         let audio = model
@@ -604,16 +700,59 @@ pub unsafe extern "C" fn indextts_generate(
                 &model.cancelled,
             )
             .map_err(|error| error.to_string())?;
-        let mut samples = audio.samples.into_boxed_slice();
-        let output = indextts_audio_out_t {
-            samples: samples.as_mut_ptr(),
-            sample_count: samples.len(),
-            sample_rate: audio.sample_rate,
-            channels: audio.channels as u32,
-            reserved: [0; 4],
-        };
-        std::mem::forget(samples);
-        *out_audio = output;
+        store_audio(audio, out_audio);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate_v2(
+    model: indextts_model_t,
+    voice: indextts_voice_t,
+    options: *const indextts_generate_options_v2_t,
+    out_audio: *mut indextts_audio_out_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || voice.is_null() || options.is_null() || out_audio.is_null() {
+            return Err("invalid arguments".into());
+        }
+        *out_audio = indextts_audio_out_t::default();
+        let options = &*options;
+        validate_reserved(&options.reserved)?;
+        validate_reserved(&options.emotion.reserved)?;
+        let (text, config) = parse_generation_options(&options.base)?;
+        let model = &*model;
+        model.cancelled.store(false, Ordering::Release);
+        let audio = match options.emotion.mode {
+            INDEXTTS_EMOTION_NONE => model.pipeline.synthesize_prepared_cancellable(
+                text,
+                &(&*voice).conditioning,
+                &config,
+                &model.cancelled,
+            ),
+            INDEXTTS_EMOTION_REFERENCE => {
+                if options.emotion.reference.is_null() {
+                    return Err("emotion reference handle is required".into());
+                }
+                model.pipeline.synthesize_prepared_with_emotion_cancellable(
+                    text,
+                    &(&*voice).conditioning,
+                    &(&*options.emotion.reference).emotion,
+                    options.emotion.strength,
+                    &config,
+                    &model.cancelled,
+                )
+            }
+            INDEXTTS_EMOTION_TEXT => {
+                return Err("emotion text is not supported by this runtime".into())
+            }
+            INDEXTTS_EMOTION_VECTOR => {
+                return Err("emotion vector is not supported by this runtime".into())
+            }
+            mode => return Err(format!("unsupported emotion mode {mode}")),
+        }
+        .map_err(|error| error.to_string())?;
+        store_audio(audio, out_audio);
         Ok(())
     })
 }
@@ -651,6 +790,15 @@ pub unsafe extern "C" fn indextts_audio_free(audio: *mut indextts_audio_out_t) {
         *output = indextts_audio_out_t::default();
     });
 }
+#[no_mangle]
+pub unsafe extern "C" fn indextts_emotion_free(emotion: indextts_emotion_t) {
+    ffi_void(|| {
+        if !emotion.is_null() {
+            drop(Box::from_raw(emotion));
+        }
+    });
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indextts_voice_free(voice: indextts_voice_t) {
     ffi_void(|| {
@@ -693,16 +841,21 @@ mod tests {
     }
     #[test]
     fn abi_version_and_capabilities_are_truthful() {
-        assert_eq!(indextts_abi_version(), 0x0001_0000);
+        assert_eq!(indextts_abi_version(), 0x0001_0001);
         let mut capabilities = indextts_capabilities_t::default();
         assert_eq!(unsafe { indextts_get_capabilities(&mut capabilities) }, 0);
         assert_eq!(capabilities.abi_major, 1);
-        assert_eq!(capabilities.abi_minor, 0);
+        assert_eq!(capabilities.abi_minor, 1);
         assert_eq!(capabilities.sample_rate, 22_050);
         assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
         assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);
         assert_eq!(capabilities.supports_request_cancellation, 0);
         assert_eq!(capabilities.supports_voice_cache, 1);
+        assert_eq!(capabilities.supports_emotion_reference, 1);
+        assert_eq!(capabilities.supports_emotion_text, 0);
+        let options = indextts_generate_options_v2_t::default();
+        assert_eq!(options.emotion.mode, INDEXTTS_EMOTION_NONE);
+        assert_eq!(options.emotion.strength, 1.0);
     }
 
     #[test]

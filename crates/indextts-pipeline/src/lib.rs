@@ -549,6 +549,21 @@ impl IndexTtsPipeline {
         runtime.reference.encode(reference_audio_path)
     }
 
+    pub fn prepare_emotion_reference(
+        &self,
+        reference_audio_path: &Path,
+    ) -> TtsResult<PreparedEmotion> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        runtime.reference.encode_emotion(reference_audio_path)
+    }
+
     /// Synthesize speech from text and a reference voice.
     #[instrument(skip(self, reference_audio_path))]
     pub fn synthesize(
@@ -612,6 +627,30 @@ impl IndexTtsPipeline {
             )
         })?;
         Self::synthesize_with_runtime(&mut runtime, text, reference, gen_config, cancelled)
+    }
+
+    pub fn synthesize_prepared_with_emotion_cancellable(
+        &self,
+        text: &str,
+        reference: &ReferenceConditioning,
+        emotion: &PreparedEmotion,
+        strength: f32,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<AudioBuffer> {
+        let voice_emotion = reference.voice_emotion.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "prepared voice has no emotion embedding; re-prepare it with an emotion-enabled model package".into(),
+            )
+        })?;
+        let mut adjusted = reference.clone();
+        adjusted.gpt_conditioning = apply_emotion_reference(
+            &reference.gpt_conditioning,
+            voice_emotion,
+            &emotion.embedding,
+            strength,
+        )?;
+        self.synthesize_prepared_cancellable(text, &adjusted, gen_config, cancelled)
     }
 
     fn synthesize_with_runtime(
