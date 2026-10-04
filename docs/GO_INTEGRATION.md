@@ -122,20 +122,13 @@ PowerShell：
 ```powershell
 Set-Location E:\mickeylan\ai\index-tts-rust
 $env:CGO_ENABLED = '1'
-$env:CGO_CFLAGS = "-I$PWD/crates/indextts-ffi"
-$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts.dll"
+$env:CGO_LDFLAGS = "-L$PWD/target/release"
 
-go -C bindings/go test ./...
+go -C bindings/go test -tags indextts_native ./...
 if ($LASTEXITCODE -ne 0) { throw "Go wrapper 编译失败：$LASTEXITCODE" }
 ```
 
-当前 `bindings/go/indextts.go` 已内置 header 相对路径：
-
-```go
-#cgo CFLAGS: -I../../crates/indextts-ffi
-```
-
-所以在仓库内测试时，`CGO_CFLAGS` 通常可省略；`CGO_LDFLAGS` 仍需告诉 MinGW linker 到哪里找 `libindextts.dll.a`。该 GNU import library 由发布脚本自动生成。
+Go module 内含同步的 `bindings/go/indextts.h`，不再引用仓库外 Header。默认构建使用安全 stub，不要求 DLL；Windows 原生实现必须显式启用 `indextts_native` build tag。`CGO_LDFLAGS` 只需指定包含 `libindextts.dll.a` 的目录，`-lindextts` 已由 module 声明。
 
 ## 6. 在独立 Go 项目中引用
 
@@ -236,9 +229,9 @@ func main() {
 ```powershell
 $rustRepo = 'E:\mickeylan\ai\index-tts-rust'
 $env:CGO_ENABLED = '1'
-$env:CGO_LDFLAGS = "-L$rustRepo/target/release -lindextts.dll"
+$env:CGO_LDFLAGS = "-L$rustRepo/target/release"
 
-go build -o bin\tts-service.exe .
+go build -tags indextts_native -o bin\tts-service.exe .
 if ($LASTEXITCODE -ne 0) { throw "Go build 失败：$LASTEXITCODE" }
 ```
 
@@ -434,7 +427,7 @@ CUDA 需要使用 `cargo build --release -p indextts-ffi --features cuda` 生成
 func (m *Model) PrepareVoice(path string) (*Voice, error)
 ```
 
-当前实现会验证和读取参考音频，然后保存路径。生成时仍会重新进行 reference conditioning；当前不是完整的条件缓存。
+当前实现会立即完成 Wav2Vec2-BERT、CAMPPlus、GPT conditioning、reference mel 和 prompt conditioning，并按原始内容 SHA-256 在 Model 内进行有界 LRU 缓存。后续生成不再读取原 WAV；源文件删除后，已准备的 Voice 仍可继续使用。
 
 参考 WAV 建议 3–15 秒、单人、无音乐、非静音。
 
@@ -768,8 +761,8 @@ Push-Location target\release
 & 'D:\mingw-w64\bin\dlltool.exe' -d indextts.def -D indextts.dll -l libindextts.dll.a -m i386:x86-64
 Pop-Location
 
-$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts.dll"
-go -C bindings/go test ./...
+$env:CGO_LDFLAGS = "-L$PWD/target/release"
+go -C bindings/go test -tags indextts_native ./...
 ```
 
 ### 已有测试与真实 CUDA 集成测试
@@ -781,7 +774,7 @@ $env:INDEXTTS_TEST_MODEL = 'E:\models\indextts25-rust'
 $env:INDEXTTS_TEST_VOICE = 'K:\ComfyUI\models\TTS\IndexTTS-2.5\voices\official-demo\voice_03.wav'
 $env:INDEXTTS_TEST_DEVICE = 'cuda'
 $env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts.dll"
-go -C bindings/go test -v -count=1 ./...
+go -C bindings/go test -tags indextts_native -v -count=1 ./...
 ```
 
 已覆盖 `Version()`、错误设备和真实 CUDA 音频生成。后续仍建议补充：
@@ -801,7 +794,7 @@ go -C bindings/go test -v -count=1 ./...
 ### 运行 race detector
 
 ```powershell
-go -C bindings/go test -race ./...
+go -C bindings/go test -tags indextts_native -race ./...
 ```
 
 cgo 和 Windows race 支持受 Go 版本/工具链约束；即使 race detector 通过，也不能证明 C/Rust 内存完全安全。
