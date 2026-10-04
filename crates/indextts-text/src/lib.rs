@@ -278,6 +278,49 @@ impl TextNormalizer {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSegment {
+    pub text: String,
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+/// Deterministically split normalized text while preserving every character.
+/// Sentence punctuation is preferred over semicolons, then commas, before the hard boundary.
+pub fn segment_text(text: &str, max_chars: usize) -> Result<Vec<TextSegment>> {
+    if max_chars == 0 {
+        return Err(indextts_core::IndexTtsError::InvalidText(
+            "segment size must be greater than zero".into(),
+        ));
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let hard_end = (start + max_chars).min(chars.len());
+        let end = if hard_end == chars.len() {
+            hard_end
+        } else {
+            ["。！？!?", "；;", "，,"]
+                .iter()
+                .find_map(|punctuation| {
+                    (start..hard_end)
+                        .rev()
+                        .find(|index| punctuation.contains(chars[*index]))
+                        .map(|index| index + 1)
+                })
+                .unwrap_or(hard_end)
+        };
+        segments.push(TextSegment {
+            text: chars[start..end].iter().collect(),
+            start_char: start,
+            end_char: end,
+        });
+        start = end;
+    }
+    Ok(segments)
+}
+
 /// Normalize text with default settings
 pub fn normalize(text: &str, language: Language) -> Result<String> {
     TextNormalizer::new().normalize(text, language)
@@ -292,6 +335,37 @@ mod tests {
         let normalizer = TextNormalizer::new();
         let result = normalizer.normalize("<你好|nihao>", Language::Zh).unwrap();
         assert_eq!(result, "nihao");
+    }
+
+    #[test]
+    fn deterministic_segments_preserve_text_and_prioritize_punctuation() {
+        let text = "甲乙，丙丁；戊己。庚辛壬癸";
+        let segments = segment_text(text, 6).unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["甲乙，丙丁；", "戊己。", "庚辛壬癸"]
+        );
+        assert_eq!(segments.concat_text(), text);
+        for segment in &segments {
+            assert_eq!(
+                segment.end_char - segment.start_char,
+                segment.text.chars().count()
+            );
+            assert!(segment.text.chars().count() <= 6);
+        }
+        assert_eq!(segment_text(text, 6).unwrap(), segments);
+    }
+
+    trait SegmentTestExt {
+        fn concat_text(&self) -> String;
+    }
+    impl SegmentTestExt for Vec<TextSegment> {
+        fn concat_text(&self) -> String {
+            self.iter().map(|part| part.text.as_str()).collect()
+        }
     }
 
     #[test]
