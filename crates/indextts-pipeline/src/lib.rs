@@ -25,9 +25,10 @@ use indextts_ort::{
     run_semantic_codec, run_wav2vec2bert, solve_cfm_bucketed_cancellable, BigVganBuckets,
     DitBuckets, OnnxModel, OnnxSession, Tensor, Wav2VecStats,
 };
-use indextts_text::TextNormalizer;
+use indextts_text::{segment_text, TextNormalizer};
 use indextts_tokenizer::{language_token_id, IndexTtsTokenizer};
 use std::{
+    ops::Range,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -470,7 +471,32 @@ impl SemanticRuntime {
             ));
         }
         let normalized = self.normalizer.normalize(text, language)?;
-        let tokens = self.tokenizer.tokenize_for_gpt(&normalized, language)?;
+        self.generate_normalized_with_reference_cancellable(
+            &normalized,
+            language,
+            reference,
+            max_tokens,
+            cancelled,
+        )
+    }
+
+    fn generate_normalized_with_reference_cancellable(
+        &mut self,
+        normalized_text: &str,
+        language: Language,
+        reference: &ReferenceConditioning,
+        max_tokens: usize,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<SemanticCodes> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
+        if normalized_text.trim().is_empty() {
+            return Err(indextts_core::IndexTtsError::InvalidText(
+                "text is empty after normalization".into(),
+            ));
+        }
+        let tokens = self.tokenizer.tokenize_for_gpt(normalized_text, language)?;
         let conditioning = ort_f32_to_candle(&reference.gpt_conditioning, self.gpt.device())?;
         let prefix = self
             .gpt
@@ -667,6 +693,177 @@ pub struct GenerationDiagnostics {
 pub struct SynthesisResult {
     pub audio: AudioBuffer,
     pub diagnostics: GenerationDiagnostics,
+}
+
+/// Segmentation and joining options for deterministic long-text synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongTextConfig {
+    /// Maximum number of Unicode scalar values in one segment.
+    pub max_chars: usize,
+    /// Silence inserted between adjacent segments. An unsigned value makes it nonnegative.
+    pub pause_ms: u64,
+}
+
+impl Default for LongTextConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: 200,
+            pause_ms: 200,
+        }
+    }
+}
+
+/// Metadata for one synthesized segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LongTextSegment {
+    /// Character range in `LongTextSynthesisResult::normalized_text`.
+    pub text_range: Range<usize>,
+    pub semantic_token_count: u32,
+    /// Start of segment speech in the aggregate 22,050 Hz mono buffer.
+    pub audio_offset_samples: usize,
+    /// Segment speech length, excluding inter-segment silence.
+    pub audio_duration_samples: usize,
+    pub seed: u64,
+}
+
+/// Audio, aggregate diagnostics, and segment metadata from long-text synthesis.
+#[derive(Debug, Clone)]
+pub struct LongTextSynthesisResult {
+    pub audio: AudioBuffer,
+    pub diagnostics: GenerationDiagnostics,
+    pub normalized_text: String,
+    pub segments: Vec<LongTextSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedSegment {
+    text: String,
+    text_range: Range<usize>,
+    seed: u64,
+}
+
+/// Normalize-independent deterministic planning. Seed addition is checked rather than wrapping.
+fn plan_long_text(
+    normalized_text: &str,
+    max_chars: usize,
+    base_seed: u64,
+) -> TtsResult<Vec<PlannedSegment>> {
+    if normalized_text.trim().is_empty() {
+        return Err(indextts_core::IndexTtsError::InvalidText(
+            "text is empty after normalization".into(),
+        ));
+    }
+    segment_text(normalized_text, max_chars)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let seed_offset = u64::try_from(index).map_err(|_| {
+                indextts_core::IndexTtsError::InvalidText(
+                    "long-text segment index does not fit in u64".into(),
+                )
+            })?;
+            let seed = base_seed.checked_add(seed_offset).ok_or_else(|| {
+                indextts_core::IndexTtsError::InvalidText(format!(
+                    "long-text seed overflow at segment {index}"
+                ))
+            })?;
+            Ok(PlannedSegment {
+                text: segment.text,
+                text_range: segment.start_char..segment.end_char,
+                seed,
+            })
+        })
+        .collect()
+}
+
+fn pause_samples(pause_ms: u64) -> TtsResult<usize> {
+    let samples = u128::from(pause_ms) * 22_050 / 1_000;
+    usize::try_from(samples).map_err(|_| {
+        indextts_core::IndexTtsError::InvalidAudio(
+            "long-text pause is too large for this platform".into(),
+        )
+    })
+}
+
+fn concatenate_long_text(
+    planned: &[PlannedSegment],
+    results: Vec<SynthesisResult>,
+    pause_ms: u64,
+) -> TtsResult<(AudioBuffer, GenerationDiagnostics, Vec<LongTextSegment>)> {
+    if planned.len() != results.len() {
+        return Err(indextts_core::IndexTtsError::InvalidAudio(
+            "long-text plan/result count mismatch".into(),
+        ));
+    }
+    let pause = pause_samples(pause_ms)?;
+    let speech_samples = results.iter().try_fold(0usize, |total, result| {
+        if result.audio.sample_rate != 22_050 || result.audio.channels != 1 {
+            return Err(indextts_core::IndexTtsError::InvalidAudio(format!(
+                "long-text segment audio must be 22050 Hz mono, got {} Hz and {} channels",
+                result.audio.sample_rate, result.audio.channels
+            )));
+        }
+        total
+            .checked_add(result.audio.samples.len())
+            .ok_or_else(|| {
+                indextts_core::IndexTtsError::InvalidAudio("long-text audio is too large".into())
+            })
+    })?;
+    let total_pause = pause
+        .checked_mul(results.len().saturating_sub(1))
+        .ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidAudio("long-text audio is too large".into())
+        })?;
+    let capacity = speech_samples.checked_add(total_pause).ok_or_else(|| {
+        indextts_core::IndexTtsError::InvalidAudio("long-text audio is too large".into())
+    })?;
+    let mut samples = Vec::with_capacity(capacity);
+    let mut segments = Vec::with_capacity(results.len());
+    let mut diagnostics = GenerationDiagnostics::default();
+
+    for (index, (plan, result)) in planned.iter().zip(results).enumerate() {
+        if index != 0 {
+            samples.resize(samples.len() + pause, 0.0);
+        }
+        let audio_offset_samples = samples.len();
+        let audio_duration_samples = result.audio.samples.len();
+        diagnostics.semantic_token_count = diagnostics
+            .semantic_token_count
+            .saturating_add(result.diagnostics.semantic_token_count);
+        diagnostics.reference_encode_ms += result.diagnostics.reference_encode_ms;
+        diagnostics.gpt_ms += result.diagnostics.gpt_ms;
+        diagnostics.semantic_codec_ms += result.diagnostics.semantic_codec_ms;
+        diagnostics.s2mel_ms += result.diagnostics.s2mel_ms;
+        diagnostics.bigvgan_ms += result.diagnostics.bigvgan_ms;
+        diagnostics.total_ms += result.diagnostics.total_ms;
+        samples.extend(result.audio.samples);
+        segments.push(LongTextSegment {
+            text_range: plan.text_range.clone(),
+            semantic_token_count: result.diagnostics.semantic_token_count,
+            audio_offset_samples,
+            audio_duration_samples,
+            seed: plan.seed,
+        });
+    }
+
+    let peak = samples
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f32, f32::max);
+    let (rms, silence_ratio) = if samples.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            (samples.iter().map(|value| value * value).sum::<f32>() / samples.len() as f32).sqrt(),
+            samples.iter().filter(|value| value.abs() < 1e-4).count() as f32 / samples.len() as f32,
+        )
+    };
+    diagnostics.generated_seconds = samples.len() as f32 / 22_050.0;
+    diagnostics.peak = peak;
+    diagnostics.rms = rms;
+    diagnostics.silence_ratio = silence_ratio;
+    diagnostics.seed = planned.first().map_or(0, |segment| segment.seed);
+    Ok((AudioBuffer::new(samples, 22_050), diagnostics, segments))
 }
 
 /// End-to-end IndexTTS pipeline.
@@ -886,6 +1083,62 @@ impl IndexTtsPipeline {
         gen_config: &GenerationConfig,
         cancelled: &AtomicBool,
     ) -> TtsResult<SynthesisResult> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let mut runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        Self::synthesize_prepared_result_with_runtime(
+            &mut runtime,
+            text,
+            false,
+            reference,
+            gen_config,
+            cancelled,
+        )
+    }
+
+    /// Deterministically normalize, segment, synthesize, and join long text.
+    pub fn synthesize_long_text_prepared_result(
+        &self,
+        text: &str,
+        reference: &ReferenceConditioning,
+        gen_config: &GenerationConfig,
+        long_config: &LongTextConfig,
+    ) -> TtsResult<LongTextSynthesisResult> {
+        let cancelled = AtomicBool::new(false);
+        self.synthesize_long_text_prepared_result_cancellable(
+            text,
+            reference,
+            gen_config,
+            long_config,
+            &cancelled,
+        )
+    }
+
+    /// Cancellable deterministic long-text synthesis.
+    ///
+    /// The prepared voice and loaded runtime are reused for every segment. Segment `i` uses
+    /// `gen_config.seed + i`; overflow is rejected rather than wrapped.
+    pub fn synthesize_long_text_prepared_result_cancellable(
+        &self,
+        text: &str,
+        reference: &ReferenceConditioning,
+        gen_config: &GenerationConfig,
+        long_config: &LongTextConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<LongTextSynthesisResult> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
+        if gen_config.do_sample || gen_config.num_beams != 1 {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "the end-to-end runtime currently supports greedy generation only".into(),
+            ));
+        }
         let total_start = Instant::now();
         let runtime = self.runtime.as_ref().ok_or_else(|| {
             indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
@@ -895,17 +1148,74 @@ impl IndexTtsPipeline {
                 "pipeline runtime lock was poisoned".into(),
             )
         })?;
+        let normalized_text = runtime.normalizer.normalize(text, gen_config.language)?;
+        let planned = plan_long_text(&normalized_text, long_config.max_chars, gen_config.seed)?;
+        let mut results = Vec::with_capacity(planned.len());
+        for (index, segment) in planned.iter().enumerate() {
+            // This explicit boundary check avoids starting another segment after cancellation.
+            if cancelled.load(Ordering::Acquire) {
+                return Err(indextts_core::IndexTtsError::Cancelled);
+            }
+            let mut segment_config = gen_config.clone();
+            segment_config.seed = segment.seed;
+            let result = Self::synthesize_prepared_result_with_runtime(
+                &mut runtime,
+                &segment.text,
+                true,
+                reference,
+                &segment_config,
+                cancelled,
+            )
+            .map_err(|error| match error {
+                indextts_core::IndexTtsError::Cancelled => indextts_core::IndexTtsError::Cancelled,
+                error => indextts_core::IndexTtsError::BackendFailure(format!(
+                    "long-text segment {index} failed: {error}"
+                )),
+            })?;
+            results.push(result);
+        }
+        let (audio, mut diagnostics, segments) =
+            concatenate_long_text(&planned, results, long_config.pause_ms)?;
+        diagnostics.total_ms = total_start.elapsed().as_secs_f32() * 1000.0;
+        Ok(LongTextSynthesisResult {
+            audio,
+            diagnostics,
+            normalized_text,
+            segments,
+        })
+    }
+
+    fn synthesize_prepared_result_with_runtime(
+        runtime: &mut SemanticRuntime,
+        text: &str,
+        text_is_normalized: bool,
+        reference: &ReferenceConditioning,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<SynthesisResult> {
+        let total_start = Instant::now();
         if cancelled.load(Ordering::Acquire) {
             return Err(indextts_core::IndexTtsError::Cancelled);
         }
         let gpt_start = Instant::now();
-        let codes = runtime.generate_with_reference_cancellable(
-            text,
-            gen_config.language,
-            reference,
-            gen_config.max_length.unwrap_or(1815),
-            cancelled,
-        )?;
+        let max_tokens = gen_config.max_length.unwrap_or(1815);
+        let codes = if text_is_normalized {
+            runtime.generate_normalized_with_reference_cancellable(
+                text,
+                gen_config.language,
+                reference,
+                max_tokens,
+                cancelled,
+            )?
+        } else {
+            runtime.generate_with_reference_cancellable(
+                text,
+                gen_config.language,
+                reference,
+                max_tokens,
+                cancelled,
+            )?
+        };
         let gpt_ms = gpt_start.elapsed().as_secs_f32() * 1000.0;
         let codec_start = Instant::now();
         let decoded = run_semantic_codec(&runtime.semantic_codec, &codes.tokens)?;
@@ -1066,6 +1376,104 @@ mod tests {
         let unchanged = apply_emotion_reference(&conditioning, &voice, &reference, 0.0).unwrap();
         assert_eq!(unchanged, conditioning);
         assert!(apply_emotion_reference(&conditioning, &voice, &reference, f32::NAN).is_err());
+    }
+
+    #[test]
+    fn long_text_plan_has_stable_ranges_and_checked_seeds() {
+        let planned = plan_long_text("甲乙，丙丁。戊己", 4, 41).unwrap();
+        assert_eq!(
+            planned,
+            vec![
+                PlannedSegment {
+                    text: "甲乙，".into(),
+                    text_range: 0..3,
+                    seed: 41,
+                },
+                PlannedSegment {
+                    text: "丙丁。".into(),
+                    text_range: 3..6,
+                    seed: 42,
+                },
+                PlannedSegment {
+                    text: "戊己".into(),
+                    text_range: 6..8,
+                    seed: 43,
+                },
+            ]
+        );
+        let error = plan_long_text("甲乙", 1, u64::MAX).unwrap_err();
+        assert!(error.to_string().contains("segment 1"));
+        assert!(plan_long_text("", 10, 0).is_err());
+        assert!(plan_long_text("text", 0, 0).is_err());
+    }
+
+    #[test]
+    fn long_text_concatenation_inserts_pause_and_aggregates_metadata() {
+        let planned = vec![
+            PlannedSegment {
+                text: "one".into(),
+                text_range: 0..3,
+                seed: 7,
+            },
+            PlannedSegment {
+                text: "two".into(),
+                text_range: 3..6,
+                seed: 8,
+            },
+        ];
+        let make_result = |samples: Vec<f32>, tokens, seed| SynthesisResult {
+            audio: AudioBuffer::new(samples, 22_050),
+            diagnostics: GenerationDiagnostics {
+                semantic_token_count: tokens,
+                gpt_ms: 1.0,
+                total_ms: 2.0,
+                seed,
+                ..GenerationDiagnostics::default()
+            },
+        };
+        let (audio, diagnostics, segments) = concatenate_long_text(
+            &planned,
+            vec![
+                make_result(vec![0.5, -0.5], 2, 7),
+                make_result(vec![0.25], 3, 8),
+            ],
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(audio.sample_rate, 22_050);
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.samples.len(), 2 + 2_205 + 1);
+        assert_eq!(&audio.samples[..2], &[0.5, -0.5]);
+        assert!(audio.samples[2..2 + 2_205]
+            .iter()
+            .all(|sample| *sample == 0.0));
+        assert_eq!(audio.samples.last(), Some(&0.25));
+        assert_eq!(segments[0].audio_offset_samples, 0);
+        assert_eq!(segments[0].audio_duration_samples, 2);
+        assert_eq!(segments[1].audio_offset_samples, 2 + 2_205);
+        assert_eq!(segments[1].audio_duration_samples, 1);
+        assert_eq!(segments[1].text_range, 3..6);
+        assert_eq!(segments[1].seed, 8);
+        assert_eq!(diagnostics.semantic_token_count, 5);
+        assert_eq!(diagnostics.gpt_ms, 2.0);
+        assert_eq!(diagnostics.total_ms, 4.0);
+        assert_eq!(diagnostics.seed, 7);
+        assert_eq!(diagnostics.peak, 0.5);
+    }
+
+    #[test]
+    fn long_text_concatenation_rejects_wrong_audio_format() {
+        let planned = vec![PlannedSegment {
+            text: "text".into(),
+            text_range: 0..4,
+            seed: 0,
+        }];
+        let result = SynthesisResult {
+            audio: AudioBuffer::new(vec![0.0], 16_000),
+            diagnostics: GenerationDiagnostics::default(),
+        };
+        assert!(concatenate_long_text(&planned, vec![result], 0).is_err());
     }
 
     #[test]
