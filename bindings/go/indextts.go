@@ -12,6 +12,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -257,6 +258,19 @@ type OptionsV2 struct {
 	Emotion EmotionOptions
 }
 
+type GenerationInfo struct {
+	SemanticTokens                                             uint32
+	GeneratedSeconds                                           float32
+	ReferenceEncode, GPT, SemanticCodec, S2Mel, BigVGAN, Total time.Duration
+	Peak, RMS, SilenceRatio                                    float32
+	Seed                                                       uint64
+}
+
+type GenerationResult struct {
+	Audio Audio
+	Info  GenerationInfo
+}
+
 func (m *Model) PrepareEmotionReference(path string) (*Emotion, error) {
 	m.life.RLock()
 	defer m.life.RUnlock()
@@ -339,132 +353,18 @@ func (m *Model) GenerateContext(ctx context.Context, v *Voice, text string, opti
 	if err := ctx.Err(); err != nil {
 		return Audio{}, err
 	}
-	cancelWatchDone := make(chan struct{})
-	cancelWatchStopped := make(chan struct{})
-	go func() {
-		defer close(cancelWatchStopped)
-		select {
-		case <-ctx.Done():
-			_ = m.Cancel()
-		case <-cancelWatchDone:
-		}
-	}()
-	var output C.indextts_audio_out_t
-	nativeMu.Lock()
-	status := C.indextts_generate(m.h, v.h, &config, &output)
-	var nativeErr error
-	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
-		nativeErr = nativeError()
-	}
-	nativeMu.Unlock()
-	close(cancelWatchDone)
-	<-cancelWatchStopped
-	if status == C.INDEXTTS_CANCELLED {
-		if err := ctx.Err(); err != nil {
-			return Audio{}, err
-		}
-		return Audio{}, ErrCancelled
-	}
-	if status != C.INDEXTTS_OK {
-		return Audio{}, nativeErr
-	}
-	defer C.indextts_audio_free(&output)
-	count := int(output.sample_count)
-	if count < 0 || C.size_t(count) != output.sample_count {
-		return Audio{}, errors.New("native audio is too large for this Go process")
-	}
-	nativeSamples := unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)
-	floats := append([]float32(nil), nativeSamples...)
-	runtime.KeepAlive(v)
-	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
-}
-
-func (m *Model) GenerateV2(v *Voice, text string, options OptionsV2) (Audio, error) {
-	return m.GenerateV2Context(context.Background(), v, text, options)
-}
-
-func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, options OptionsV2) (Audio, error) {
-	if ctx == nil {
-		return Audio{}, errors.New("context is nil")
-	}
-	m.life.RLock()
-	defer m.life.RUnlock()
-	m.call.Lock()
-	defer m.call.Unlock()
-	if v == nil {
-		return Audio{}, errors.New("model or voice is closed")
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if m.h == nil || v.h == nil || v.model != m {
-		return Audio{}, errors.New("model or voice is closed or mismatched")
-	}
-	if options.Language == "" {
-		options.Language = "ZH"
-	}
-	if options.DurationFactor == 0 {
-		options.DurationFactor = 1
-	}
-	ctext, clang := C.CString(text), C.CString(options.Language)
-	defer C.free(unsafe.Pointer(ctext))
-	defer C.free(unsafe.Pointer(clang))
-	var config C.indextts_generate_options_v2_t
-	C.indextts_generate_options_v2_init(&config)
-	config.base.text, config.base.language = ctext, clang
-	config.base.seed, config.base.duration_factor = C.uint64_t(options.Seed), C.float(options.DurationFactor)
-	config.emotion.mode = C.int32_t(options.Emotion.Mode)
-	config.emotion.strength = C.float(options.Emotion.Strength)
-	var emotion *Emotion
-	if options.Emotion.Mode == EmotionReference {
-		emotion = options.Emotion.Reference
-		if emotion == nil {
-			return Audio{}, errors.New("emotion reference is required")
-		}
-		emotion.mu.Lock()
-		defer emotion.mu.Unlock()
-		if emotion.h == nil || emotion.model != m {
-			return Audio{}, errors.New("emotion is closed or belongs to another model")
-		}
-		config.emotion.reference = emotion.h
-	} else if options.Emotion.Mode == EmotionText {
-		return Audio{}, errors.New("emotion text is not supported by this runtime")
-	} else if options.Emotion.Mode == EmotionVector {
-		if len(options.Emotion.Vector) != 8 {
-			return Audio{}, errors.New("emotion vector must contain exactly 8 values")
-		}
-		vectorMemory := C.malloc(C.size_t(len(options.Emotion.Vector)) * C.size_t(unsafe.Sizeof(C.float(0))))
-		if vectorMemory == nil {
-			return Audio{}, errors.New("failed to allocate native emotion vector")
-		}
-		defer C.free(vectorMemory)
-		copy(unsafe.Slice((*float32)(vectorMemory), 8), options.Emotion.Vector)
-		config.emotion.vector = (*C.float)(vectorMemory)
-		config.emotion.vector_length = 8
-	}
-	if err := ctx.Err(); err != nil {
-		return Audio{}, err
-	}
-	var request C.indextts_request_t
-	nativeMu.Lock()
-	if C.indextts_request_create(m.h, &request) != C.INDEXTTS_OK {
-		err := nativeError()
-		nativeMu.Unlock()
-		return Audio{}, err
-	}
-	nativeMu.Unlock()
-	defer C.indextts_request_free(request)
 	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
 		select {
 		case <-ctx.Done():
-			C.indextts_request_cancel(request)
+			_ = m.Cancel()
 		case <-done:
 		}
 	}()
 	var output C.indextts_audio_out_t
 	nativeMu.Lock()
-	status := C.indextts_generate_request_v2(m.h, request, v.h, &config, &output)
+	status := C.indextts_generate(m.h, v.h, &config, &output)
 	var nativeErr error
 	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
 		nativeErr = nativeError()
@@ -488,9 +388,141 @@ func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, op
 	}
 	floats := append([]float32(nil), unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)...)
 	runtime.KeepAlive(v)
+	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
+}
+
+func (m *Model) GenerateV2(v *Voice, text string, options OptionsV2) (Audio, error) {
+	return m.GenerateV2Context(context.Background(), v, text, options)
+}
+
+func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, options OptionsV2) (Audio, error) {
+	result, err := m.GenerateV2ResultContext(ctx, v, text, options)
+	return result.Audio, err
+}
+
+func (m *Model) GenerateV2Result(v *Voice, text string, options OptionsV2) (GenerationResult, error) {
+	return m.GenerateV2ResultContext(context.Background(), v, text, options)
+}
+
+func (m *Model) GenerateV2ResultContext(ctx context.Context, v *Voice, text string, options OptionsV2) (GenerationResult, error) {
+	if ctx == nil {
+		return GenerationResult{}, errors.New("context is nil")
+	}
+	m.life.RLock()
+	defer m.life.RUnlock()
+	m.call.Lock()
+	defer m.call.Unlock()
+	if v == nil {
+		return GenerationResult{}, errors.New("model or voice is closed")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if m.h == nil || v.h == nil || v.model != m {
+		return GenerationResult{}, errors.New("model or voice is closed or mismatched")
+	}
+	if options.Language == "" {
+		options.Language = "ZH"
+	}
+	if options.DurationFactor == 0 {
+		options.DurationFactor = 1
+	}
+	ctext, clang := C.CString(text), C.CString(options.Language)
+	defer C.free(unsafe.Pointer(ctext))
+	defer C.free(unsafe.Pointer(clang))
+	var config C.indextts_generate_options_v2_t
+	C.indextts_generate_options_v2_init(&config)
+	config.base.text, config.base.language = ctext, clang
+	config.base.seed, config.base.duration_factor = C.uint64_t(options.Seed), C.float(options.DurationFactor)
+	config.emotion.mode = C.int32_t(options.Emotion.Mode)
+	config.emotion.strength = C.float(options.Emotion.Strength)
+	var emotion *Emotion
+	if options.Emotion.Mode == EmotionReference {
+		emotion = options.Emotion.Reference
+		if emotion == nil {
+			return GenerationResult{}, errors.New("emotion reference is required")
+		}
+		emotion.mu.Lock()
+		defer emotion.mu.Unlock()
+		if emotion.h == nil || emotion.model != m {
+			return GenerationResult{}, errors.New("emotion is closed or belongs to another model")
+		}
+		config.emotion.reference = emotion.h
+	} else if options.Emotion.Mode == EmotionText {
+		return GenerationResult{}, errors.New("emotion text is not supported by this runtime")
+	} else if options.Emotion.Mode == EmotionVector {
+		if len(options.Emotion.Vector) != 8 {
+			return GenerationResult{}, errors.New("emotion vector must contain exactly 8 values")
+		}
+		vectorMemory := C.malloc(C.size_t(len(options.Emotion.Vector)) * C.size_t(unsafe.Sizeof(C.float(0))))
+		if vectorMemory == nil {
+			return GenerationResult{}, errors.New("failed to allocate native emotion vector")
+		}
+		defer C.free(vectorMemory)
+		copy(unsafe.Slice((*float32)(vectorMemory), 8), options.Emotion.Vector)
+		config.emotion.vector = (*C.float)(vectorMemory)
+		config.emotion.vector_length = 8
+	}
+	if err := ctx.Err(); err != nil {
+		return GenerationResult{}, err
+	}
+	var request C.indextts_request_t
+	nativeMu.Lock()
+	if C.indextts_request_create(m.h, &request) != C.INDEXTTS_OK {
+		err := nativeError()
+		nativeMu.Unlock()
+		return GenerationResult{}, err
+	}
+	nativeMu.Unlock()
+	defer C.indextts_request_free(request)
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			C.indextts_request_cancel(request)
+		case <-done:
+		}
+	}()
+	var output C.indextts_generation_result_t
+	nativeMu.Lock()
+	status := C.indextts_generate_result_request_v2(m.h, request, v.h, &config, &output)
+	var nativeErr error
+	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
+		nativeErr = nativeError()
+	}
+	nativeMu.Unlock()
+	close(done)
+	<-stopped
+	if status == C.INDEXTTS_CANCELLED {
+		if err := ctx.Err(); err != nil {
+			return GenerationResult{}, err
+		}
+		return GenerationResult{}, ErrCancelled
+	}
+	if status != C.INDEXTTS_OK {
+		return GenerationResult{}, nativeErr
+	}
+	defer C.indextts_audio_free(&output.audio)
+	count := int(output.audio.sample_count)
+	if count < 0 || C.size_t(count) != output.audio.sample_count {
+		return GenerationResult{}, errors.New("native audio is too large for this Go process")
+	}
+	floats := append([]float32(nil), unsafe.Slice((*float32)(unsafe.Pointer(output.audio.samples)), count)...)
+	runtime.KeepAlive(v)
 	runtime.KeepAlive(emotion)
 	runtime.KeepAlive(options.Emotion.Vector)
-	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
+	milliseconds := func(value C.float) time.Duration { return time.Duration(float64(value) * float64(time.Millisecond)) }
+	return GenerationResult{
+		Audio: Audio{Samples: floats, SampleRate: uint32(output.audio.sample_rate), Channels: uint32(output.audio.channels)},
+		Info: GenerationInfo{
+			SemanticTokens: uint32(output.info.semantic_token_count), GeneratedSeconds: float32(output.info.generated_seconds),
+			ReferenceEncode: milliseconds(output.info.reference_encode_ms), GPT: milliseconds(output.info.gpt_ms),
+			SemanticCodec: milliseconds(output.info.semantic_codec_ms), S2Mel: milliseconds(output.info.s2mel_ms),
+			BigVGAN: milliseconds(output.info.bigvgan_ms), Total: milliseconds(output.info.total_ms),
+			Peak: float32(output.info.peak), RMS: float32(output.info.rms), SilenceRatio: float32(output.info.silence_ratio),
+			Seed: uint64(output.info.seed),
+		},
+	}, nil
 }
 
 func Version() string { return C.GoString(C.indextts_version()) }

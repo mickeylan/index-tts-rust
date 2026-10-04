@@ -118,6 +118,27 @@ typedef struct {
     uint64_t reserved[4];
 } indextts_audio_out_t;
 
+typedef struct {
+    uint32_t semantic_token_count;
+    float generated_seconds;
+    float reference_encode_ms;
+    float gpt_ms;
+    float semantic_codec_ms;
+    float s2mel_ms;
+    float bigvgan_ms;
+    float total_ms;
+    float peak;
+    float rms;
+    float silence_ratio;
+    uint64_t seed;
+    uint64_t reserved[8];
+} indextts_generation_info_t;
+
+typedef struct {
+    indextts_audio_out_t audio;
+    indextts_generation_info_t info;
+} indextts_generation_result_t;
+
 #define INDEXTTS_OK 0
 #define INDEXTTS_ERROR -1
 #define INDEXTTS_PANIC -2
@@ -138,6 +159,7 @@ INDEXTTS_API int32_t indextts_generate_v2(indextts_model_t model, indextts_voice
 INDEXTTS_API void indextts_emotion_free(indextts_emotion_t emotion);
 INDEXTTS_API int32_t indextts_request_create(indextts_model_t model, indextts_request_t *out_request);
 INDEXTTS_API int32_t indextts_generate_request_v2(indextts_model_t model, indextts_request_t request, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_audio_out_t *out_audio);
+INDEXTTS_API int32_t indextts_generate_result_request_v2(indextts_model_t model, indextts_request_t request, indextts_voice_t voice, const indextts_generate_options_v2_t *options, indextts_generation_result_t *out_result);
 INDEXTTS_API int32_t indextts_request_cancel(indextts_request_t request);
 INDEXTTS_API void indextts_request_free(indextts_request_t request);
 /* Thread-safe cooperative cancellation; returns immediately. */

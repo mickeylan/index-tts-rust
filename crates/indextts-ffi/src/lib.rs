@@ -6,7 +6,10 @@ use indextts_audio::process_reference_audio;
 use indextts_core::{
     AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision,
 };
-use indextts_pipeline::{IndexTtsPipeline, PreparedEmotion, ReferenceConditioning};
+use indextts_pipeline::{
+    GenerationDiagnostics, IndexTtsPipeline, PreparedEmotion, ReferenceConditioning,
+    SynthesisResult,
+};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -192,6 +195,31 @@ impl Default for indextts_audio_out_t {
             reserved: [0; 4],
         }
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct indextts_generation_info_t {
+    pub semantic_token_count: u32,
+    pub generated_seconds: f32,
+    pub reference_encode_ms: f32,
+    pub gpt_ms: f32,
+    pub semantic_codec_ms: f32,
+    pub s2mel_ms: f32,
+    pub bigvgan_ms: f32,
+    pub total_ms: f32,
+    pub peak: f32,
+    pub rms: f32,
+    pub silence_ratio: f32,
+    pub seed: u64,
+    pub reserved: [u64; 8],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct indextts_generation_result_t {
+    pub audio: indextts_audio_out_t,
+    pub info: indextts_generation_info_t,
 }
 
 #[repr(C)]
@@ -683,6 +711,24 @@ unsafe fn store_audio(audio: indextts_core::AudioBuffer, out_audio: *mut indextt
     std::mem::forget(samples);
 }
 
+fn generation_info(value: GenerationDiagnostics) -> indextts_generation_info_t {
+    indextts_generation_info_t {
+        semantic_token_count: value.semantic_token_count,
+        generated_seconds: value.generated_seconds,
+        reference_encode_ms: value.reference_encode_ms,
+        gpt_ms: value.gpt_ms,
+        semantic_codec_ms: value.semantic_codec_ms,
+        s2mel_ms: value.s2mel_ms,
+        bigvgan_ms: value.bigvgan_ms,
+        total_ms: value.total_ms,
+        peak: value.peak,
+        rms: value.rms,
+        silence_ratio: value.silence_ratio,
+        seed: value.seed,
+        reserved: [0; 8],
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indextts_generate(
     model: indextts_model_t,
@@ -766,6 +812,64 @@ unsafe fn generate_v2_inner(
     .map_err(|error| error.to_string())
 }
 
+unsafe fn generate_result_v2_inner(
+    model: &IndexTtsModelHandle,
+    voice: &IndexTtsVoiceHandle,
+    options: &indextts_generate_options_v2_t,
+    cancelled: &AtomicBool,
+) -> Result<SynthesisResult, String> {
+    validate_reserved(&options.reserved)?;
+    validate_reserved(&options.emotion.reserved)?;
+    let (text, config) = parse_generation_options(&options.base)?;
+    match options.emotion.mode {
+        INDEXTTS_EMOTION_NONE => model.pipeline.synthesize_prepared_result_cancellable(
+            text,
+            &voice.conditioning,
+            &config,
+            cancelled,
+        ),
+        INDEXTTS_EMOTION_REFERENCE => {
+            if options.emotion.reference.is_null() {
+                return Err("emotion reference handle is required".into());
+            }
+            model
+                .pipeline
+                .synthesize_prepared_with_emotion_result_cancellable(
+                    text,
+                    &voice.conditioning,
+                    &(&*options.emotion.reference).emotion,
+                    options.emotion.strength,
+                    &config,
+                    cancelled,
+                )
+        }
+        INDEXTTS_EMOTION_TEXT => return Err("emotion text is not supported by this runtime".into()),
+        INDEXTTS_EMOTION_VECTOR => {
+            if options.emotion.vector.is_null() || options.emotion.vector_length != 8 {
+                return Err("emotion vector must contain exactly 8 values".into());
+            }
+            let values = std::slice::from_raw_parts(options.emotion.vector, 8);
+            let weights: [f32; 8] = values.try_into().map_err(|_| "invalid emotion vector")?;
+            let emotion = model
+                .pipeline
+                .prepare_emotion_vector(&voice.conditioning, &weights, options.emotion.strength)
+                .map_err(|error| error.to_string())?;
+            model
+                .pipeline
+                .synthesize_prepared_with_emotion_result_cancellable(
+                    text,
+                    &voice.conditioning,
+                    &emotion,
+                    1.0,
+                    &config,
+                    cancelled,
+                )
+        }
+        mode => return Err(format!("unsupported emotion mode {mode}")),
+    }
+    .map_err(|error| error.to_string())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn indextts_generate_v2(
     model: indextts_model_t,
@@ -827,6 +931,35 @@ pub unsafe extern "C" fn indextts_generate_request_v2(
         (&*request).cancelled.store(false, Ordering::Release);
         let audio = generate_v2_inner(&*model, &*voice, &*options, &(&*request).cancelled)?;
         store_audio(audio, out_audio);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_generate_result_request_v2(
+    model: indextts_model_t,
+    request: indextts_request_t,
+    voice: indextts_voice_t,
+    options: *const indextts_generate_options_v2_t,
+    out_result: *mut indextts_generation_result_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null()
+            || request.is_null()
+            || voice.is_null()
+            || options.is_null()
+            || out_result.is_null()
+        {
+            return Err("invalid arguments".into());
+        }
+        if (&*request).model != model as usize {
+            return Err("request belongs to another model".into());
+        }
+        *out_result = indextts_generation_result_t::default();
+        (&*request).cancelled.store(false, Ordering::Release);
+        let result = generate_result_v2_inner(&*model, &*voice, &*options, &(&*request).cancelled)?;
+        store_audio(result.audio, &mut (*out_result).audio);
+        (*out_result).info = generation_info(result.diagnostics);
         Ok(())
     })
 }

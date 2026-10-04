@@ -32,6 +32,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
+    time::Instant,
 };
 use tracing::{info, instrument};
 
@@ -637,6 +638,28 @@ fn ort_f32_to_candle(tensor: &Tensor, device: &Device) -> TtsResult<CandleTensor
         .map_err(|error| indextts_core::IndexTtsError::BackendFailure(error.to_string()))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenerationDiagnostics {
+    pub semantic_token_count: u32,
+    pub generated_seconds: f32,
+    pub reference_encode_ms: f32,
+    pub gpt_ms: f32,
+    pub semantic_codec_ms: f32,
+    pub s2mel_ms: f32,
+    pub bigvgan_ms: f32,
+    pub total_ms: f32,
+    pub peak: f32,
+    pub rms: f32,
+    pub silence_ratio: f32,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SynthesisResult {
+    pub audio: AudioBuffer,
+    pub diagnostics: GenerationDiagnostics,
+}
+
 /// End-to-end IndexTTS pipeline.
 #[derive(Debug)]
 pub struct IndexTtsPipeline {
@@ -809,6 +832,119 @@ impl IndexTtsPipeline {
             strength,
         )?;
         self.synthesize_prepared_cancellable(text, &adjusted, gen_config, cancelled)
+    }
+
+    pub fn synthesize_prepared_with_emotion_result_cancellable(
+        &self,
+        text: &str,
+        reference: &ReferenceConditioning,
+        emotion: &PreparedEmotion,
+        strength: f32,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<SynthesisResult> {
+        let voice_emotion = reference.voice_emotion.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "prepared voice has no emotion embedding".into(),
+            )
+        })?;
+        let mut adjusted = reference.clone();
+        adjusted.gpt_conditioning = apply_emotion_reference(
+            &reference.gpt_conditioning,
+            voice_emotion,
+            &emotion.embedding,
+            strength,
+        )?;
+        self.synthesize_prepared_result_cancellable(text, &adjusted, gen_config, cancelled)
+    }
+
+    pub fn synthesize_prepared_result_cancellable(
+        &self,
+        text: &str,
+        reference: &ReferenceConditioning,
+        gen_config: &GenerationConfig,
+        cancelled: &AtomicBool,
+    ) -> TtsResult<SynthesisResult> {
+        let total_start = Instant::now();
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let mut runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
+        let gpt_start = Instant::now();
+        let codes = runtime.generate_with_reference_cancellable(
+            text,
+            gen_config.language,
+            reference,
+            gen_config.max_length.unwrap_or(1815),
+            cancelled,
+        )?;
+        let gpt_ms = gpt_start.elapsed().as_secs_f32() * 1000.0;
+        let codec_start = Instant::now();
+        let decoded = run_semantic_codec(&runtime.semantic_codec, &codes.tokens)?;
+        let decoded_frames = decoded.shape()[1] as usize;
+        let generated_frames = (decoded_frames as f32 * 1.72 * gen_config.duration_factor) as usize;
+        let generated_condition =
+            run_length_regulator(&runtime.length_regulator, decoded, generated_frames)?;
+        let semantic_codec_ms = codec_start.elapsed().as_secs_f32() * 1000.0;
+        let s2mel_start = Instant::now();
+        let condition = concat_conditions(&reference.prompt_condition, &generated_condition)?;
+        let full_mel = solve_cfm_bucketed_cancellable(
+            &runtime.dit_buckets,
+            &condition,
+            &reference.reference_mel,
+            &reference.speaker_style,
+            25,
+            0.7,
+            gen_config.seed,
+            cancelled,
+        )?;
+        let mel = crop_reference_mel(&full_mel, reference.reference_mel.shape()[2] as usize)?;
+        let s2mel_ms = s2mel_start.elapsed().as_secs_f32() * 1000.0;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
+        let vocoder_start = Instant::now();
+        let audio = runtime.vocode(&mel)?;
+        let bigvgan_ms = vocoder_start.elapsed().as_secs_f32() * 1000.0;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(indextts_core::IndexTtsError::Cancelled);
+        }
+        let peak = audio
+            .samples
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        let rms = (audio.samples.iter().map(|value| value * value).sum::<f32>()
+            / audio.samples.len() as f32)
+            .sqrt();
+        let silence_ratio = audio
+            .samples
+            .iter()
+            .filter(|value| value.abs() < 1e-4)
+            .count() as f32
+            / audio.samples.len() as f32;
+        let diagnostics = GenerationDiagnostics {
+            semantic_token_count: codes.tokens.len() as u32,
+            generated_seconds: audio.duration() as f32,
+            reference_encode_ms: 0.0,
+            gpt_ms,
+            semantic_codec_ms,
+            s2mel_ms,
+            bigvgan_ms,
+            total_ms: total_start.elapsed().as_secs_f32() * 1000.0,
+            peak,
+            rms,
+            silence_ratio,
+            seed: gen_config.seed,
+        };
+        Ok(SynthesisResult { audio, diagnostics })
     }
 
     fn synthesize_with_runtime(
