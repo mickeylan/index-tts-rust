@@ -13,18 +13,27 @@ import (
 	"context"
 	"errors"
 	"runtime"
-	"sync"
 	"time"
 	"unsafe"
 )
-
-var nativeMu sync.Mutex
 
 func nativeError() error {
 	if p := C.indextts_last_error(); p != nil {
 		return errors.New(C.GoString(p))
 	}
 	return errors.New("IndexTTS native call failed")
+}
+
+// nativeCall keeps the C call and last-error lookup on the same OS thread.
+// The native runtime stores its last error in thread-local storage.
+func nativeCall(call func() C.int32_t) (C.int32_t, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	status := call()
+	if status != C.INDEXTTS_OK {
+		return status, nativeError()
+	}
+	return status, nil
 }
 
 func fixedString(pointer *C.char, length int) string {
@@ -40,8 +49,8 @@ func ABIVersion() uint32 { return uint32(C.indextts_abi_version()) }
 
 func GetCapabilities() (Capabilities, error) {
 	var value C.indextts_capabilities_t
-	if C.indextts_get_capabilities(&value) != C.INDEXTTS_OK {
-		return Capabilities{}, nativeError()
+	if _, err := nativeCall(func() C.int32_t { return C.indextts_get_capabilities(&value) }); err != nil {
+		return Capabilities{}, err
 	}
 	return Capabilities{
 		ABIMajor: uint32(value.abi_major), ABIMinor: uint32(value.abi_minor), SampleRate: uint32(value.sample_rate),
@@ -60,8 +69,6 @@ func Load(modelDir string) (*Model, error) {
 }
 
 func LoadWithOptions(loadOptions LoadOptions) (*Model, error) {
-	nativeMu.Lock()
-	defer nativeMu.Unlock()
 	if loadOptions.ModelDir == "" {
 		return nil, errors.New("IndexTTS model directory is empty")
 	}
@@ -82,8 +89,8 @@ func LoadWithOptions(loadOptions LoadOptions) (*Model, error) {
 		return nil, errors.New("unsupported IndexTTS device: " + string(loadOptions.Device))
 	}
 	var handle C.indextts_model_t
-	if C.indextts_model_load(&options, &handle) != C.INDEXTTS_OK {
-		return nil, nativeError()
+	if _, err := nativeCall(func() C.int32_t { return C.indextts_model_load(&options, &handle) }); err != nil {
+		return nil, err
 	}
 	model := &Model{h: unsafe.Pointer(handle)}
 	runtime.SetFinalizer(model, (*Model).Close)
@@ -97,8 +104,10 @@ func (m *Model) Info() (ModelInfo, error) {
 		return ModelInfo{}, errors.New("IndexTTS model is closed")
 	}
 	var value C.indextts_model_info_t
-	if C.indextts_model_get_info(C.indextts_model_t(m.h), &value) != C.INDEXTTS_OK {
-		return ModelInfo{}, nativeError()
+	if _, err := nativeCall(func() C.int32_t {
+		return C.indextts_model_get_info(C.indextts_model_t(m.h), &value)
+	}); err != nil {
+		return ModelInfo{}, err
 	}
 	return ModelInfo{
 		RuntimeVersion: fixedString(&value.runtime_version[0], 64), ModelVersion: fixedString(&value.model_version[0], 64),
@@ -114,8 +123,10 @@ func (m *Model) Health() (Health, error) {
 		return Health{}, errors.New("IndexTTS model is closed")
 	}
 	var value C.indextts_health_t
-	if C.indextts_model_health(C.indextts_model_t(m.h), &value) != C.INDEXTTS_OK {
-		return Health{}, nativeError()
+	if _, err := nativeCall(func() C.int32_t {
+		return C.indextts_model_health(C.indextts_model_t(m.h), &value)
+	}); err != nil {
+		return Health{}, err
 	}
 	return Health{
 		Loaded: value.loaded != 0, DeviceHealthy: value.device_healthy != 0,
@@ -155,14 +166,12 @@ func (m *Model) PrepareVoicePCM(samples []float32, sampleRate, channels uint32) 
 	defer C.free(memory)
 	copy(unsafe.Slice((*float32)(memory), len(samples)), samples)
 	var handle C.indextts_voice_t
-	nativeMu.Lock()
-	status := C.indextts_voice_prepare_pcm(C.indextts_model_t(m.h), (*C.float)(memory), C.size_t(len(samples)), C.uint32_t(sampleRate), C.uint32_t(channels), &handle)
-	if status != C.INDEXTTS_OK {
-		err := nativeError()
-		nativeMu.Unlock()
+	_, err := nativeCall(func() C.int32_t {
+		return C.indextts_voice_prepare_pcm(C.indextts_model_t(m.h), (*C.float)(memory), C.size_t(len(samples)), C.uint32_t(sampleRate), C.uint32_t(channels), &handle)
+	})
+	if err != nil {
 		return nil, err
 	}
-	nativeMu.Unlock()
 	voice := &Voice{model: m, h: unsafe.Pointer(handle)}
 	runtime.SetFinalizer(voice, (*Voice).Close)
 	return voice, nil
@@ -179,14 +188,12 @@ func (m *Model) PrepareVoice(path string) (*Voice, error) {
 	value := C.CString(path)
 	defer C.free(unsafe.Pointer(value))
 	var handle C.indextts_voice_t
-	nativeMu.Lock()
-	status := C.indextts_voice_prepare(C.indextts_model_t(m.h), value, &handle)
-	if status != C.INDEXTTS_OK {
-		err := nativeError()
-		nativeMu.Unlock()
+	_, err := nativeCall(func() C.int32_t {
+		return C.indextts_voice_prepare(C.indextts_model_t(m.h), value, &handle)
+	})
+	if err != nil {
 		return nil, err
 	}
-	nativeMu.Unlock()
 	voice := &Voice{model: m, h: unsafe.Pointer(handle)}
 	runtime.SetFinalizer(voice, (*Voice).Close)
 	return voice, nil
@@ -199,8 +206,10 @@ func (v *Voice) Info() (VoiceInfo, error) {
 		return VoiceInfo{}, errors.New("IndexTTS voice is closed")
 	}
 	var value C.indextts_voice_info_t
-	if C.indextts_voice_get_info(C.indextts_voice_t(v.h), &value) != C.INDEXTTS_OK {
-		return VoiceInfo{}, nativeError()
+	if _, err := nativeCall(func() C.int32_t {
+		return C.indextts_voice_get_info(C.indextts_voice_t(v.h), &value)
+	}); err != nil {
+		return VoiceInfo{}, err
 	}
 	return VoiceInfo{
 		ReferenceSHA256: fixedString(&value.reference_sha256[0], 65), DurationSeconds: float32(value.duration_seconds),
@@ -230,14 +239,12 @@ func (m *Model) PrepareEmotionReference(path string) (*Emotion, error) {
 	value := C.CString(path)
 	defer C.free(unsafe.Pointer(value))
 	var handle C.indextts_emotion_t
-	nativeMu.Lock()
-	status := C.indextts_emotion_prepare_reference(C.indextts_model_t(m.h), value, &handle)
-	if status != C.INDEXTTS_OK {
-		err := nativeError()
-		nativeMu.Unlock()
+	_, err := nativeCall(func() C.int32_t {
+		return C.indextts_emotion_prepare_reference(C.indextts_model_t(m.h), value, &handle)
+	})
+	if err != nil {
 		return nil, err
 	}
-	nativeMu.Unlock()
 	emotion := &Emotion{model: m, h: unsafe.Pointer(handle)}
 	runtime.SetFinalizer(emotion, (*Emotion).Close)
 	return emotion, nil
@@ -263,8 +270,10 @@ func (m *Model) Cancel() error {
 	if m.h == nil {
 		return errors.New("IndexTTS model is closed")
 	}
-	if C.indextts_model_cancel(C.indextts_model_t(m.h)) != C.INDEXTTS_OK {
-		return errors.New("IndexTTS cancellation request failed")
+	if _, err := nativeCall(func() C.int32_t {
+		return C.indextts_model_cancel(C.indextts_model_t(m.h))
+	}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -311,13 +320,9 @@ func (m *Model) GenerateContext(ctx context.Context, v *Voice, text string, opti
 		}
 	}()
 	var output C.indextts_audio_out_t
-	nativeMu.Lock()
-	status := C.indextts_generate(C.indextts_model_t(m.h), C.indextts_voice_t(v.h), &config, &output)
-	var nativeErr error
-	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
-		nativeErr = nativeError()
-	}
-	nativeMu.Unlock()
+	status, nativeErr := nativeCall(func() C.int32_t {
+		return C.indextts_generate(C.indextts_model_t(m.h), C.indextts_voice_t(v.h), &config, &output)
+	})
 	close(done)
 	<-stopped
 	if status == C.INDEXTTS_CANCELLED {
@@ -414,31 +419,25 @@ func (m *Model) GenerateV2ResultContext(ctx context.Context, v *Voice, text stri
 		return GenerationResult{}, err
 	}
 	var request C.indextts_request_t
-	nativeMu.Lock()
-	if C.indextts_request_create(C.indextts_model_t(m.h), &request) != C.INDEXTTS_OK {
-		err := nativeError()
-		nativeMu.Unlock()
+	if _, err := nativeCall(func() C.int32_t {
+		return C.indextts_request_create(C.indextts_model_t(m.h), &request)
+	}); err != nil {
 		return GenerationResult{}, err
 	}
-	nativeMu.Unlock()
 	defer C.indextts_request_free(request)
 	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
 		select {
 		case <-ctx.Done():
-			C.indextts_request_cancel(request)
+			_, _ = nativeCall(func() C.int32_t { return C.indextts_request_cancel(request) })
 		case <-done:
 		}
 	}()
 	var output C.indextts_generation_result_t
-	nativeMu.Lock()
-	status := C.indextts_generate_result_request_v2(C.indextts_model_t(m.h), request, C.indextts_voice_t(v.h), &config, &output)
-	var nativeErr error
-	if status != C.INDEXTTS_OK && status != C.INDEXTTS_CANCELLED {
-		nativeErr = nativeError()
-	}
-	nativeMu.Unlock()
+	status, nativeErr := nativeCall(func() C.int32_t {
+		return C.indextts_generate_result_request_v2(C.indextts_model_t(m.h), request, C.indextts_voice_t(v.h), &config, &output)
+	})
 	close(done)
 	<-stopped
 	if status == C.INDEXTTS_CANCELLED {
