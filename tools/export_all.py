@@ -42,7 +42,8 @@ def main() -> None:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--checkpoints", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--buckets", nargs="+", type=int, default=[256, 512, 1024, 2048])
+    parser.add_argument("--dit-buckets", nargs="+", type=int, default=[256, 512, 1024])
+    parser.add_argument("--bigvgan-buckets", nargs="+", type=int, default=[256, 512])
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     output = args.output.resolve()
@@ -62,9 +63,13 @@ def main() -> None:
     for component in COMPONENTS:
         run(exporter, component, "--source", args.source, "--model-dir", args.checkpoints,
             "--output", output / "onnx" / component / "model.onnx")
-    for frames in sorted(set(args.buckets)):
-        for component in ("dit", "bigvgan"):
-            target = "s2mel" if component == "dit" else component
+    bucket_sets = {
+        "dit": sorted(set(args.dit_buckets)),
+        "bigvgan": sorted(set(args.bigvgan_buckets)),
+    }
+    for component, buckets in bucket_sets.items():
+        target = "s2mel" if component == "dit" else component
+        for frames in buckets:
             run(exporter, component, "--frames", frames, "--source", args.source,
                 "--model-dir", args.checkpoints,
                 "--output", output / "onnx" / target / f"model-{frames}.onnx")
@@ -74,8 +79,11 @@ def main() -> None:
         "format_version": 1,
         "model": "IndexTTS-2.5",
         "runtime": "index-tts-rust",
-        "buckets": sorted(set(args.buckets)),
+        "minimum_runtime_version": "0.1.0",
+        "s2mel_buckets": bucket_sets["dit"],
+        "bigvgan_buckets": bucket_sets["bigvgan"],
         "sample_rate": 22050,
+        "semantic": {"start_token": 8192, "stop_token": 8193, "max_tokens": 1815},
         "files": {path.relative_to(output).as_posix(): {"bytes": path.stat().st_size, "sha256": sha256(path)} for path in files},
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

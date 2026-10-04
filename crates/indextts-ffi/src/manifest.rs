@@ -48,6 +48,31 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
     if manifest.get("sample_rate").and_then(Value::as_u64) != Some(22_050) {
         return Err("model manifest sample_rate must be 22050".into());
     }
+    let minimum_runtime = manifest
+        .get("minimum_runtime_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "model manifest has no minimum_runtime_version".to_string())?;
+    if minimum_runtime != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "model requires runtime {minimum_runtime}; this runtime is {}",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    validate_u64_array(&manifest, "s2mel_buckets", &[256, 512, 1024])?;
+    validate_u64_array(&manifest, "bigvgan_buckets", &[256, 512])?;
+    let semantic = manifest
+        .get("semantic")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "model manifest has no semantic contract".to_string())?;
+    for (name, expected) in [
+        ("start_token", 8192),
+        ("stop_token", 8193),
+        ("max_tokens", 1815),
+    ] {
+        if semantic.get(name).and_then(Value::as_u64) != Some(expected) {
+            return Err(format!("model manifest semantic {name} must be {expected}"));
+        }
+    }
     let model = manifest
         .get("model")
         .and_then(Value::as_str)
@@ -107,6 +132,24 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
     })
 }
 
+fn validate_u64_array(manifest: &Value, name: &str, expected: &[u64]) -> Result<(), String> {
+    let actual: Vec<u64> = manifest
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("model manifest has no {name}"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| format!("model manifest {name} must contain integers"))
+        })
+        .collect::<Result<_, _>>()?;
+    if actual != expected {
+        return Err(format!("model manifest {name} must be {expected:?}"));
+    }
+    Ok(())
+}
+
 fn sha256_file(path: &Path) -> Result<String, String> {
     let file = File::open(path).map_err(|error| {
         format!(
@@ -157,7 +200,11 @@ mod tests {
                 "format_version": 1,
                 "model": "IndexTTS-2.5",
                 "runtime": "index-tts-rust",
+                "minimum_runtime_version": env!("CARGO_PKG_VERSION"),
+                "s2mel_buckets": [256, 512, 1024],
+                "bigvgan_buckets": [256, 512],
                 "sample_rate": 22050,
+                "semantic": {"start_token": 8192, "stop_token": 8193, "max_tokens": 1815},
                 "files": files,
             }))
             .unwrap(),
