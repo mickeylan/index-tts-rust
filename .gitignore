@@ -17,6 +17,7 @@ __pycache__/
 *.py[cod]
 
 # Build artifacts
+/dist/
 *.dll
 *.so
 *.dylib
