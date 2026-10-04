@@ -1,3 +1,5 @@
+//go:build windows && cgo && indextts_native
+
 package indextts
 
 import (
