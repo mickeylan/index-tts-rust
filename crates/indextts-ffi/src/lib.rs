@@ -402,7 +402,7 @@ pub unsafe extern "C" fn indextts_get_capabilities(
             supports_voice_cache: 1,
             supports_emotion_text: 0,
             supports_emotion_reference: 1,
-            supports_emotion_vector: 0,
+            supports_emotion_vector: 1,
             supports_target_duration: 0,
             supports_sampling: 0,
             supports_beam_search: 0,
@@ -747,7 +747,27 @@ pub unsafe extern "C" fn indextts_generate_v2(
                 return Err("emotion text is not supported by this runtime".into())
             }
             INDEXTTS_EMOTION_VECTOR => {
-                return Err("emotion vector is not supported by this runtime".into())
+                if options.emotion.vector.is_null() || options.emotion.vector_length != 8 {
+                    return Err("emotion vector must contain exactly 8 values".into());
+                }
+                let values = std::slice::from_raw_parts(options.emotion.vector, 8);
+                let weights: [f32; 8] = values.try_into().map_err(|_| "invalid emotion vector")?;
+                let emotion = model
+                    .pipeline
+                    .prepare_emotion_vector(
+                        &(&*voice).conditioning,
+                        &weights,
+                        options.emotion.strength,
+                    )
+                    .map_err(|error| error.to_string())?;
+                model.pipeline.synthesize_prepared_with_emotion_cancellable(
+                    text,
+                    &(&*voice).conditioning,
+                    &emotion,
+                    1.0,
+                    &config,
+                    &model.cancelled,
+                )
             }
             mode => return Err(format!("unsupported emotion mode {mode}")),
         }

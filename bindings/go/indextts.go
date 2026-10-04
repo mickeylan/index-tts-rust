@@ -426,8 +426,20 @@ func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, op
 			return Audio{}, errors.New("emotion is closed or belongs to another model")
 		}
 		config.emotion.reference = emotion.h
-	} else if options.Emotion.Mode == EmotionText || options.Emotion.Mode == EmotionVector {
-		return Audio{}, errors.New("emotion text/vector is not supported by this runtime")
+	} else if options.Emotion.Mode == EmotionText {
+		return Audio{}, errors.New("emotion text is not supported by this runtime")
+	} else if options.Emotion.Mode == EmotionVector {
+		if len(options.Emotion.Vector) != 8 {
+			return Audio{}, errors.New("emotion vector must contain exactly 8 values")
+		}
+		vectorMemory := C.malloc(C.size_t(len(options.Emotion.Vector)) * C.size_t(unsafe.Sizeof(C.float(0))))
+		if vectorMemory == nil {
+			return Audio{}, errors.New("failed to allocate native emotion vector")
+		}
+		defer C.free(vectorMemory)
+		copy(unsafe.Slice((*float32)(vectorMemory), 8), options.Emotion.Vector)
+		config.emotion.vector = (*C.float)(vectorMemory)
+		config.emotion.vector_length = 8
 	}
 	if err := ctx.Err(); err != nil {
 		return Audio{}, err
@@ -468,6 +480,7 @@ func (m *Model) GenerateV2Context(ctx context.Context, v *Voice, text string, op
 	floats := append([]float32(nil), unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)...)
 	runtime.KeepAlive(v)
 	runtime.KeepAlive(emotion)
+	runtime.KeepAlive(options.Emotion.Vector)
 	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
 }
 

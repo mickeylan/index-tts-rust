@@ -198,6 +198,128 @@ impl ReferenceEncoder {
     }
 }
 
+#[derive(Debug)]
+struct EmotionPrototypeBank {
+    speaker: Vec<f32>,
+    emotion: Vec<f32>,
+    offsets: Vec<usize>,
+}
+
+impl EmotionPrototypeBank {
+    fn load(path: &Path) -> TtsResult<Self> {
+        let tensors = candle_core::safetensors::load(path, &Device::Cpu)
+            .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?;
+        let speaker = tensors.get("speaker_prototypes").ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "emotion prototypes missing speaker_prototypes".into(),
+            )
+        })?;
+        let emotion = tensors.get("emotion_prototypes").ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "emotion prototypes missing emotion_prototypes".into(),
+            )
+        })?;
+        let offsets = tensors.get("group_offsets").ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "emotion prototypes missing group_offsets".into(),
+            )
+        })?;
+        if speaker.dims() != [73, 192] || emotion.dims() != [73, 1280] || offsets.dims() != [9] {
+            return Err(indextts_core::IndexTtsError::InvalidModel(
+                "invalid emotion prototype shapes".into(),
+            ));
+        }
+        Ok(Self {
+            speaker: speaker
+                .flatten_all()
+                .and_then(|value| value.to_vec1::<f32>())
+                .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?,
+            emotion: emotion
+                .flatten_all()
+                .and_then(|value| value.to_vec1::<f32>())
+                .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?,
+            offsets: offsets
+                .to_vec1::<i64>()
+                .map_err(|error| indextts_core::IndexTtsError::InvalidModel(error.to_string()))?
+                .into_iter()
+                .map(|value| value as usize)
+                .collect(),
+        })
+    }
+
+    fn mix(
+        &self,
+        speaker_style: &Tensor,
+        voice_emotion: &Tensor,
+        weights: &[f32; 8],
+        strength: f32,
+    ) -> TtsResult<PreparedEmotion> {
+        if speaker_style.shape() != [1, 192] || voice_emotion.shape() != [1, 1280] {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "invalid emotion vector inputs".into(),
+            ));
+        }
+        if !strength.is_finite()
+            || !(0.0..=1.0).contains(&strength)
+            || weights
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "invalid emotion vector or strength".into(),
+            ));
+        }
+        let scaled: Vec<f32> = weights
+            .iter()
+            .map(|value| (value * strength * 10_000.0).trunc() / 10_000.0)
+            .collect();
+        let total: f32 = scaled.iter().sum();
+        if total > 0.8001 {
+            return Err(indextts_core::IndexTtsError::BackendFailure(
+                "emotion vector sum after strength must not exceed 0.8".into(),
+            ));
+        }
+        let style = speaker_style.as_slice();
+        let mut output: Vec<f32> = voice_emotion
+            .as_slice()
+            .iter()
+            .map(|value| value * (1.0 - total))
+            .collect();
+        let style_norm = style
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt()
+            .max(1e-12);
+        for (group, group_weight) in scaled.iter().enumerate().take(8) {
+            let mut best = self.offsets[group];
+            let mut best_score = f32::NEG_INFINITY;
+            for row in self.offsets[group]..self.offsets[group + 1] {
+                let candidate = &self.speaker[row * 192..(row + 1) * 192];
+                let norm = candidate
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-12);
+                let score = style.iter().zip(candidate).map(|(a, b)| a * b).sum::<f32>()
+                    / (style_norm * norm);
+                if score > best_score {
+                    best_score = score;
+                    best = row;
+                }
+            }
+            let prototype = &self.emotion[best * 1280..(best + 1) * 1280];
+            for (value, prototype) in output.iter_mut().zip(prototype) {
+                *value += group_weight * prototype;
+            }
+        }
+        Ok(PreparedEmotion {
+            embedding: Tensor::new(output, vec![1, 1280]),
+        })
+    }
+}
+
 /// Runtime for reference-audio + text to greedy semantic codes.
 #[derive(Debug)]
 pub struct SemanticRuntime {
@@ -209,6 +331,7 @@ pub struct SemanticRuntime {
     length_regulator: OnnxSession,
     dit_buckets: DitBuckets,
     bigvgan_buckets: BigVganBuckets,
+    emotion_prototypes: Option<EmotionPrototypeBank>,
 }
 
 impl SemanticRuntime {
@@ -282,6 +405,14 @@ impl SemanticRuntime {
                 &[256, 512, 1024, 2048, 4096, 8192],
                 cuda_device,
             )?,
+            emotion_prototypes: {
+                let path = model_dir.join("emotion-prototypes.safetensors");
+                if path.is_file() {
+                    Some(EmotionPrototypeBank::load(&path)?)
+                } else {
+                    None
+                }
+            },
         })
     }
 
@@ -562,6 +693,33 @@ impl IndexTtsPipeline {
             )
         })?;
         runtime.reference.encode_emotion(reference_audio_path)
+    }
+
+    pub fn prepare_emotion_vector(
+        &self,
+        voice: &ReferenceConditioning,
+        weights: &[f32; 8],
+        strength: f32,
+    ) -> TtsResult<PreparedEmotion> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel("pipeline is not loaded".into())
+        })?;
+        let runtime = runtime.lock().map_err(|_| {
+            indextts_core::IndexTtsError::BackendFailure(
+                "pipeline runtime lock was poisoned".into(),
+            )
+        })?;
+        let bank = runtime.emotion_prototypes.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "model package has no emotion prototype bank".into(),
+            )
+        })?;
+        let voice_emotion = voice.voice_emotion.as_ref().ok_or_else(|| {
+            indextts_core::IndexTtsError::InvalidModel(
+                "prepared voice has no emotion embedding".into(),
+            )
+        })?;
+        bank.mix(&voice.speaker_style, voice_emotion, weights, strength)
     }
 
     /// Synthesize speech from text and a reference voice.

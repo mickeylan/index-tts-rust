@@ -123,6 +123,16 @@ func TestEndToEnd(t *testing.T) {
 	if len(v2Audio.Samples) == 0 || v2Audio.SampleRate != 22_050 {
 		t.Fatalf("invalid V2 audio: rate=%d samples=%d", v2Audio.SampleRate, len(v2Audio.Samples))
 	}
+	vectorAudio, err := model.GenerateV2(voice, "你好世界，这是一次Go情感向量测试。", OptionsV2{
+		Options: Options{Language: "ZH", Seed: 1234, DurationFactor: 1},
+		Emotion: EmotionOptions{Mode: EmotionVector, Vector: []float32{0.3, 0, 0, 0, 0, 0, 0, 0.2}, Strength: 1},
+	})
+	if err != nil {
+		t.Fatalf("generate emotion vector: %v", err)
+	}
+	if len(vectorAudio.Samples) == 0 || vectorAudio.SampleRate != 22_050 {
+		t.Fatalf("invalid vector audio: rate=%d samples=%d", vectorAudio.SampleRate, len(vectorAudio.Samples))
+	}
 
 	audio, err := model.Generate(voice, "你好世界，这是一次Go端到端测试。", Options{
 		Language:       "ZH",
