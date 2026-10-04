@@ -56,6 +56,13 @@ type ModelInfo struct {
 	Backend, Device                              string
 }
 
+type Health struct {
+	Loaded, DeviceHealthy              bool
+	VoiceCacheEntries, VoiceCacheBytes uint64
+	ActiveRequests, QueuedRequests     uint64
+	LastError                          string
+}
+
 type VoiceInfo struct {
 	ReferenceSHA256                  string
 	DurationSeconds                  float32
@@ -146,6 +153,24 @@ func (m *Model) Info() (ModelInfo, error) {
 		RuntimeVersion: fixedString(&value.runtime_version[0], 64), ModelVersion: fixedString(&value.model_version[0], 64),
 		ManifestSHA256: fixedString(&value.model_manifest_sha256[0], 65), Backend: fixedString(&value.backend[0], 32),
 		Device: fixedString(&value.device[0], 32),
+	}, nil
+}
+
+func (m *Model) Health() (Health, error) {
+	m.life.RLock()
+	defer m.life.RUnlock()
+	if m.h == nil {
+		return Health{}, errors.New("IndexTTS model is closed")
+	}
+	var value C.indextts_health_t
+	if C.indextts_model_health(m.h, &value) != C.INDEXTTS_OK {
+		return Health{}, nativeError()
+	}
+	return Health{
+		Loaded: value.loaded != 0, DeviceHealthy: value.device_healthy != 0,
+		VoiceCacheEntries: uint64(value.voice_cache_entries), VoiceCacheBytes: uint64(value.voice_cache_bytes),
+		ActiveRequests: uint64(value.active_requests), QueuedRequests: uint64(value.queued_requests),
+		LastError: fixedString(&value.last_error[0], 512),
 	}, nil
 }
 

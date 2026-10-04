@@ -17,7 +17,7 @@ use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -26,6 +26,7 @@ pub struct IndexTtsModelHandle {
     cancelled: Arc<AtomicBool>,
     info: ModelInfo,
     voice_cache: Mutex<VoiceCache>,
+    active_requests: AtomicU64,
 }
 pub struct IndexTtsVoiceHandle {
     conditioning: Arc<ReferenceConditioning>,
@@ -54,6 +55,14 @@ struct VoiceCache {
 
 impl VoiceCache {
     const MAX_ENTRIES: usize = 16;
+
+    fn total_bytes(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|entry| conditioning_bytes(entry))
+            .sum()
+    }
+
     fn get(&mut self, key: &str) -> Option<Arc<ReferenceConditioning>> {
         let value = self.entries.get(key)?.clone();
         self.order.retain(|item| item != key);
@@ -247,6 +256,34 @@ pub struct indextts_capabilities_t {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct indextts_health_t {
+    pub loaded: i32,
+    pub device_healthy: i32,
+    pub voice_cache_entries: u64,
+    pub voice_cache_bytes: u64,
+    pub active_requests: u64,
+    pub queued_requests: u64,
+    pub last_error: [libc::c_char; 512],
+    pub reserved: [u64; 8],
+}
+
+impl Default for indextts_health_t {
+    fn default() -> Self {
+        Self {
+            loaded: 0,
+            device_healthy: 0,
+            voice_cache_entries: 0,
+            voice_cache_bytes: 0,
+            active_requests: 0,
+            queued_requests: 0,
+            last_error: [0; 512],
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct indextts_model_info_t {
     pub runtime_version: [libc::c_char; 64],
     pub model_version: [libc::c_char; 64],
@@ -294,7 +331,7 @@ impl Default for indextts_voice_info_t {
 }
 
 const ABI_MAJOR: u32 = 1;
-const ABI_MINOR: u32 = 3;
+const ABI_MINOR: u32 = 4;
 
 static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
@@ -472,6 +509,34 @@ pub unsafe extern "C" fn indextts_model_get_info(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn indextts_model_health(
+    model: indextts_model_t,
+    health: *mut indextts_health_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || health.is_null() {
+            return Err("invalid arguments".into());
+        }
+        let model = &*model;
+        let cache = model
+            .voice_cache
+            .lock()
+            .map_err(|_| "voice cache lock was poisoned")?;
+        let mut output = indextts_health_t::default();
+        output.loaded = model.pipeline.is_loaded() as i32;
+        // This is a non-invasive health query: successful model loading is the only safe
+        // device signal available without allocating tensors or running inference.
+        output.device_healthy = output.loaded;
+        output.voice_cache_entries = cache.entries.len() as u64;
+        output.voice_cache_bytes = cache.total_bytes();
+        output.active_requests = model.active_requests.load(Ordering::Acquire);
+        output.queued_requests = 0;
+        *health = output;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn indextts_voice_get_info(
     voice: indextts_voice_t,
     info: *mut indextts_voice_info_t,
@@ -576,6 +641,7 @@ pub unsafe extern "C" fn indextts_model_load(
             cancelled: Arc::new(AtomicBool::new(false)),
             info,
             voice_cache: Mutex::new(VoiceCache::default()),
+            active_requests: AtomicU64::new(0),
         }));
         Ok(())
     })
@@ -743,6 +809,7 @@ pub unsafe extern "C" fn indextts_generate(
         *out_audio = indextts_audio_out_t::default();
         let (text, config) = parse_generation_options(&*options)?;
         let model = &*model;
+        let _active = ActiveRequestGuard::new(&model.active_requests);
         model.cancelled.store(false, Ordering::Release);
         let audio = model
             .pipeline
@@ -756,6 +823,21 @@ pub unsafe extern "C" fn indextts_generate(
         store_audio(audio, out_audio);
         Ok(())
     })
+}
+
+struct ActiveRequestGuard<'a>(&'a AtomicU64);
+
+impl<'a> ActiveRequestGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 unsafe fn generate_v2_inner(
@@ -883,6 +965,7 @@ pub unsafe extern "C" fn indextts_generate_v2(
         }
         *out_audio = indextts_audio_out_t::default();
         let model = &*model;
+        let _active = ActiveRequestGuard::new(&model.active_requests);
         model.cancelled.store(false, Ordering::Release);
         let audio = generate_v2_inner(model, &*voice, &*options, &model.cancelled)?;
         store_audio(audio, out_audio);
@@ -928,8 +1011,10 @@ pub unsafe extern "C" fn indextts_generate_request_v2(
             return Err("request belongs to another model".into());
         }
         *out_audio = indextts_audio_out_t::default();
+        let model_ref = &*model;
+        let _active = ActiveRequestGuard::new(&model_ref.active_requests);
         (&*request).cancelled.store(false, Ordering::Release);
-        let audio = generate_v2_inner(&*model, &*voice, &*options, &(&*request).cancelled)?;
+        let audio = generate_v2_inner(model_ref, &*voice, &*options, &(&*request).cancelled)?;
         store_audio(audio, out_audio);
         Ok(())
     })
@@ -956,8 +1041,11 @@ pub unsafe extern "C" fn indextts_generate_result_request_v2(
             return Err("request belongs to another model".into());
         }
         *out_result = indextts_generation_result_t::default();
+        let model_ref = &*model;
+        let _active = ActiveRequestGuard::new(&model_ref.active_requests);
         (&*request).cancelled.store(false, Ordering::Release);
-        let result = generate_result_v2_inner(&*model, &*voice, &*options, &(&*request).cancelled)?;
+        let result =
+            generate_result_v2_inner(model_ref, &*voice, &*options, &(&*request).cancelled)?;
         store_audio(result.audio, &mut (*out_result).audio);
         (*out_result).info = generation_info(result.diagnostics);
         Ok(())
@@ -1070,11 +1158,11 @@ mod tests {
     }
     #[test]
     fn abi_version_and_capabilities_are_truthful() {
-        assert_eq!(indextts_abi_version(), 0x0001_0003);
+        assert_eq!(indextts_abi_version(), 0x0001_0004);
         let mut capabilities = indextts_capabilities_t::default();
         assert_eq!(unsafe { indextts_get_capabilities(&mut capabilities) }, 0);
         assert_eq!(capabilities.abi_major, 1);
-        assert_eq!(capabilities.abi_minor, 3);
+        assert_eq!(capabilities.abi_minor, 4);
         assert_eq!(capabilities.sample_rate, 22_050);
         assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
         assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);
@@ -1130,6 +1218,7 @@ mod tests {
                 device: "cpu".into(),
             },
             voice_cache: Mutex::new(VoiceCache::default()),
+            active_requests: AtomicU64::new(0),
         });
         let pointer = Box::into_raw(handle);
         assert_eq!(unsafe { indextts_model_cancel(pointer) }, 0);

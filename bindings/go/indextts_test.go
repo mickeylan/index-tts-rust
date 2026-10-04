@@ -10,14 +10,14 @@ import (
 )
 
 func TestVersion(t *testing.T) {
-	if ABIVersion() != 0x00010003 {
+	if ABIVersion() != 0x00010004 {
 		t.Fatalf("unexpected ABI version %#x", ABIVersion())
 	}
 	capabilities, err := GetCapabilities()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 3 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
+	if capabilities.ABIMajor != 1 || capabilities.ABIMinor != 4 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU || !capabilities.SupportsEmotionReference {
 		t.Fatalf("unexpected capabilities: %+v", capabilities)
 	}
 	if Version() == "" {
@@ -78,6 +78,13 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if len(voiceInfo.ReferenceSHA256) != 64 || voiceInfo.DurationSeconds <= 0 || voiceInfo.SourceSampleRate == 0 || voiceInfo.CacheBytes == 0 {
 		t.Fatalf("invalid voice info: %+v", voiceInfo)
+	}
+	health, err := model.Health()
+	if err != nil {
+		t.Fatalf("model health: %v", err)
+	}
+	if !health.Loaded || !health.DeviceHealthy || health.VoiceCacheEntries == 0 || health.VoiceCacheBytes == 0 {
+		t.Fatalf("invalid model health: %+v", health)
 	}
 
 	if err := os.Remove(cachedVoicePath); err != nil {

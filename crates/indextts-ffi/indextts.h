@@ -93,6 +93,17 @@ typedef struct {
 } indextts_capabilities_t;
 
 typedef struct {
+    int32_t loaded;
+    int32_t device_healthy;
+    uint64_t voice_cache_entries;
+    uint64_t voice_cache_bytes;
+    uint64_t active_requests;
+    uint64_t queued_requests;
+    char last_error[512];
+    uint64_t reserved[8];
+} indextts_health_t;
+
+typedef struct {
     char runtime_version[64];
     char model_version[64];
     char model_manifest_sha256[65];
@@ -147,6 +158,7 @@ typedef struct {
 INDEXTTS_API uint32_t indextts_abi_version(void);
 INDEXTTS_API int32_t indextts_get_capabilities(indextts_capabilities_t *capabilities);
 INDEXTTS_API int32_t indextts_model_get_info(indextts_model_t model, indextts_model_info_t *info);
+INDEXTTS_API int32_t indextts_model_health(indextts_model_t model, indextts_health_t *health);
 INDEXTTS_API int32_t indextts_voice_get_info(indextts_voice_t voice, indextts_voice_info_t *info);
 INDEXTTS_API void indextts_model_options_init(indextts_model_options_t *options);
 INDEXTTS_API void indextts_generate_options_init(indextts_generate_options_t *options);
