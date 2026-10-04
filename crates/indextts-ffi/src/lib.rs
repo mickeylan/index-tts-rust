@@ -28,6 +28,7 @@ pub struct IndexTtsModelHandle {
     cancelled: Arc<AtomicBool>,
     info: ModelInfo,
     voice_cache: Mutex<VoiceCache>,
+    voice_prepare_lock: Mutex<()>,
     generation_lock: Mutex<()>,
     active_requests: AtomicU64,
     queued_requests: AtomicU64,
@@ -696,6 +697,7 @@ pub unsafe extern "C" fn indextts_model_load(
             cancelled: Arc::new(AtomicBool::new(false)),
             info,
             voice_cache: Mutex::new(VoiceCache::default()),
+            voice_prepare_lock: Mutex::new(()),
             generation_lock: Mutex::new(()),
             active_requests: AtomicU64::new(0),
             queued_requests: AtomicU64::new(0),
@@ -722,6 +724,12 @@ pub unsafe extern "C" fn indextts_voice_prepare(
         let (_, processed) = process_reference_audio(&path).map_err(|error| error.to_string())?;
         let reference_sha256 = sha256_hex(&bytes);
         let model = &*model;
+        // Serialize cache misses so concurrent preparation of identical content cannot
+        // run the expensive reference encoders more than once.
+        let _prepare = model
+            .voice_prepare_lock
+            .lock()
+            .map_err(|_| "voice preparation lock was poisoned")?;
         let conditioning = {
             let mut cache = model
                 .voice_cache
@@ -798,6 +806,10 @@ pub unsafe extern "C" fn indextts_voice_prepare_pcm(
         let (_, processed) =
             process_reference_buffer(source.clone()).map_err(|error| error.to_string())?;
         let model = &*model;
+        let _prepare = model
+            .voice_prepare_lock
+            .lock()
+            .map_err(|_| "voice preparation lock was poisoned")?;
         let conditioning = {
             let mut cache = model
                 .voice_cache
@@ -1634,6 +1646,7 @@ mod tests {
                 device: "cpu".into(),
             },
             voice_cache: Mutex::new(VoiceCache::default()),
+            voice_prepare_lock: Mutex::new(()),
             generation_lock: Mutex::new(()),
             active_requests: AtomicU64::new(0),
             queued_requests: AtomicU64::new(0),
@@ -1655,6 +1668,7 @@ mod tests {
                 device: "cpu".into(),
             },
             voice_cache: Mutex::new(VoiceCache::default()),
+            voice_prepare_lock: Mutex::new(()),
             generation_lock: Mutex::new(()),
             active_requests: AtomicU64::new(0),
             queued_requests: AtomicU64::new(0),

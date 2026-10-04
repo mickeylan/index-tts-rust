@@ -20,7 +20,10 @@ const REQUIRED_FILES: &[&str] = &[
     "onnx/semantic-codec/model.onnx",
     "onnx/length-regulator/model.onnx",
     "onnx/s2mel/model-256.onnx",
+    "onnx/s2mel/model-512.onnx",
+    "onnx/s2mel/model-1024.onnx",
     "onnx/bigvgan/model-256.onnx",
+    "onnx/bigvgan/model-512.onnx",
 ];
 
 #[derive(Debug)]
@@ -52,14 +55,14 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
         .get("minimum_runtime_version")
         .and_then(Value::as_str)
         .ok_or_else(|| "model manifest has no minimum_runtime_version".to_string())?;
-    if minimum_runtime != env!("CARGO_PKG_VERSION") {
+    if parse_version(minimum_runtime)? > parse_version(env!("CARGO_PKG_VERSION"))? {
         return Err(format!(
             "model requires runtime {minimum_runtime}; this runtime is {}",
             env!("CARGO_PKG_VERSION")
         ));
     }
-    validate_u64_array(&manifest, "s2mel_buckets", &[256, 512, 1024])?;
-    validate_u64_array(&manifest, "bigvgan_buckets", &[256, 512])?;
+    let s2mel_buckets = validate_u64_array(&manifest, "s2mel_buckets", &[256, 512, 1024])?;
+    let bigvgan_buckets = validate_u64_array(&manifest, "bigvgan_buckets", &[256, 512])?;
     let semantic = manifest
         .get("semantic")
         .and_then(Value::as_object)
@@ -89,6 +92,12 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
                 "model manifest is missing required component {required}"
             ));
         }
+    }
+    for bucket in s2mel_buckets {
+        require_manifest_file(files, &format!("onnx/s2mel/model-{bucket}.onnx"))?;
+    }
+    for bucket in bigvgan_buckets {
+        require_manifest_file(files, &format!("onnx/bigvgan/model-{bucket}.onnx"))?;
     }
     for (relative, metadata) in files {
         let relative_path = Path::new(relative);
@@ -132,7 +141,39 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
     })
 }
 
-fn validate_u64_array(manifest: &Value, name: &str, expected: &[u64]) -> Result<(), String> {
+fn require_manifest_file(
+    files: &serde_json::Map<String, Value>,
+    relative: &str,
+) -> Result<(), String> {
+    if files.contains_key(relative) {
+        Ok(())
+    } else {
+        Err(format!(
+            "model manifest is missing declared bucket {relative}"
+        ))
+    }
+}
+
+fn parse_version(value: &str) -> Result<(u64, u64, u64), String> {
+    let core = value.split_once('-').map_or(value, |(core, _)| core);
+    let components: Vec<_> = core.split('.').collect();
+    if components.len() != 3 {
+        return Err(format!("invalid runtime version {value}"));
+    }
+    Ok((
+        components[0]
+            .parse()
+            .map_err(|_| format!("invalid runtime version {value}"))?,
+        components[1]
+            .parse()
+            .map_err(|_| format!("invalid runtime version {value}"))?,
+        components[2]
+            .parse()
+            .map_err(|_| format!("invalid runtime version {value}"))?,
+    ))
+}
+
+fn validate_u64_array(manifest: &Value, name: &str, expected: &[u64]) -> Result<Vec<u64>, String> {
     let actual: Vec<u64> = manifest
         .get(name)
         .and_then(Value::as_array)
@@ -147,7 +188,7 @@ fn validate_u64_array(manifest: &Value, name: &str, expected: &[u64]) -> Result<
     if actual != expected {
         return Err(format!("model manifest {name} must be {expected:?}"));
     }
-    Ok(())
+    Ok(actual)
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -180,6 +221,17 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn runtime_version_uses_minimum_semantics() {
+        assert!(
+            parse_version("0.1.0").unwrap() <= parse_version(env!("CARGO_PKG_VERSION")).unwrap()
+        );
+        assert!(
+            parse_version("0.2.0").unwrap() > parse_version(env!("CARGO_PKG_VERSION")).unwrap()
+        );
+        assert!(parse_version("invalid").is_err());
+    }
 
     #[test]
     fn rejects_hash_mismatch_and_unsafe_paths() {
