@@ -280,69 +280,8 @@ func (m *Model) Cancel() error {
 }
 
 func (m *Model) GenerateContext(ctx context.Context, v *Voice, text string, options Options) (Audio, error) {
-	if ctx == nil {
-		return Audio{}, errors.New("context is nil")
-	}
-	m.life.RLock()
-	defer m.life.RUnlock()
-	m.call.Lock()
-	defer m.call.Unlock()
-	if v == nil {
-		return Audio{}, errors.New("model or voice is closed")
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if m.h == nil || v.h == nil || v.model != m {
-		return Audio{}, errors.New("model or voice is closed or mismatched")
-	}
-	if options.Language == "" {
-		options.Language = "ZH"
-	}
-	if options.DurationFactor == 0 {
-		options.DurationFactor = 1
-	}
-	ctext, clang := C.CString(text), C.CString(options.Language)
-	defer C.free(unsafe.Pointer(ctext))
-	defer C.free(unsafe.Pointer(clang))
-	var config C.indextts_generate_options_t
-	C.indextts_generate_options_init(&config)
-	config.text, config.language = ctext, clang
-	config.seed, config.duration_factor = C.uint64_t(options.Seed), C.float(options.DurationFactor)
-	if err := ctx.Err(); err != nil {
-		return Audio{}, err
-	}
-	done, stopped := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(stopped)
-		select {
-		case <-ctx.Done():
-			_ = m.Cancel()
-		case <-done:
-		}
-	}()
-	var output C.indextts_audio_out_t
-	status, nativeErr := nativeCall(func() C.int32_t {
-		return C.indextts_generate(C.indextts_model_t(m.h), C.indextts_voice_t(v.h), &config, &output)
-	})
-	close(done)
-	<-stopped
-	if status == C.INDEXTTS_CANCELLED {
-		if err := ctx.Err(); err != nil {
-			return Audio{}, err
-		}
-		return Audio{}, ErrCancelled
-	}
-	if status != C.INDEXTTS_OK {
-		return Audio{}, nativeErr
-	}
-	defer C.indextts_audio_free(&output)
-	count := int(output.sample_count)
-	if count < 0 || C.size_t(count) != output.sample_count {
-		return Audio{}, errors.New("native audio is too large for this Go process")
-	}
-	floats := append([]float32(nil), unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)...)
-	runtime.KeepAlive(v)
-	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
+	result, err := m.GenerateV2ResultContext(ctx, v, text, OptionsV2{Options: options})
+	return result.Audio, err
 }
 
 func (m *Model) GenerateV2(v *Voice, text string, options OptionsV2) (Audio, error) {
@@ -364,8 +303,6 @@ func (m *Model) GenerateV2ResultContext(ctx context.Context, v *Voice, text stri
 	}
 	m.life.RLock()
 	defer m.life.RUnlock()
-	m.call.Lock()
-	defer m.call.Unlock()
 	if v == nil {
 		return GenerationResult{}, errors.New("model or voice is closed")
 	}
@@ -488,8 +425,6 @@ func (m *Model) GenerateLongTextResultContext(ctx context.Context, v *Voice, tex
 	}
 	m.life.RLock()
 	defer m.life.RUnlock()
-	m.call.Lock()
-	defer m.call.Unlock()
 	if v == nil {
 		return LongTextResult{}, errors.New("model or voice is closed")
 	}
