@@ -2,7 +2,7 @@
 
 本文说明如何在 Windows 上通过 **cgo + IndexTTS C ABI**，从 Go 程序调用 `index-tts-rust`。
 
-> 当前接口状态：现有 Go wrapper 和 `indextts-ffi` 默认构建走 CPU；CUDA 已在 Rust CLI 验证，但 FFI 的 `device_index` 当前仍明确限制为 `-1`。不要把 CLI 的 `--device cuda` 用法直接套到 Go。要让 Go 使用 GPU，需要后续给 `indextts-ffi` 增加并验证 `cuda` feature 与设备选项透传。
+> 当前接口状态：CPU 和 CUDA 均已通过 Go → cgo → C ABI → Rust 的真实端到端测试。`Load` 默认使用 CPU；GPU 使用 `LoadWithOptions` 和 CUDA 版 `indextts.dll`。
 
 ## 1. 调用架构
 
@@ -61,7 +61,7 @@ github.com/mickeylan/index-tts-rust/bindings/go
 - Visual C++ linker/toolchain；
 - 已导出的 IndexTTS Rust 模型包；
 - 与构建匹配的 ONNX Runtime DLL；
-- CPU 版本无需 CUDA；GPU FFI 尚未正式开放。
+- CPU 版本无需 CUDA；GPU 版本需要 CUDA 12.8、cuDNN 9、CUDA ORT DLL 和 `indextts-ffi/cuda` 构建。
 
 检查：
 
@@ -113,7 +113,7 @@ Get-Item target\release\indextts.lib
 | `indextts.lib` | Rust staticlib；不建议直接由普通 cgo 项目手工链接全部依赖 |
 | `indextts.h` | C API 声明 |
 
-Windows Go 集成推荐使用 `indextts.dll + indextts.dll.lib`。
+MSVC C/C++ 使用 `indextts.dll + indextts.dll.lib`；Windows cgo 默认由 MinGW GCC 链接，需使用 `indextts.dll + libindextts.dll.a`。
 
 ## 5. 编译仓库自带 Go wrapper
 
@@ -123,7 +123,7 @@ PowerShell：
 Set-Location E:\mickeylan\ai\index-tts-rust
 $env:CGO_ENABLED = '1'
 $env:CGO_CFLAGS = "-I$PWD/crates/indextts-ffi"
-$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts"
+$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts.dll"
 
 go -C bindings/go test ./...
 if ($LASTEXITCODE -ne 0) { throw "Go wrapper 编译失败：$LASTEXITCODE" }
@@ -135,7 +135,7 @@ if ($LASTEXITCODE -ne 0) { throw "Go wrapper 编译失败：$LASTEXITCODE" }
 #cgo CFLAGS: -I../../crates/indextts-ffi
 ```
 
-所以在仓库内测试时，`CGO_CFLAGS` 通常可省略；`CGO_LDFLAGS` 仍需告诉 linker 到哪里找 `indextts.lib`。
+所以在仓库内测试时，`CGO_CFLAGS` 通常可省略；`CGO_LDFLAGS` 仍需告诉 MinGW linker 到哪里找 `libindextts.dll.a`。该 GNU import library 由发布脚本自动生成。
 
 ## 6. 在独立 Go 项目中引用
 
@@ -236,7 +236,7 @@ func main() {
 ```powershell
 $rustRepo = 'E:\mickeylan\ai\index-tts-rust'
 $env:CGO_ENABLED = '1'
-$env:CGO_LDFLAGS = "-L$rustRepo/target/release -lindextts"
+$env:CGO_LDFLAGS = "-L$rustRepo/target/release -lindextts.dll"
 
 go build -o bin\tts-service.exe .
 if ($LASTEXITCODE -ne 0) { throw "Go build 失败：$LASTEXITCODE" }
@@ -403,10 +403,30 @@ func Load(modelDir string) (*Model, error)
 
 当前行为：
 
-- CPU、Float32；
+- `Load` 默认 CPU、Float32；
+- `LoadWithOptions` 可选择 CPU 或 CUDA；
 - 加载 GPT 权重与全部 ONNX session；
 - 模型目录必须是已转换的 Rust runtime package；
 - 不是官方原始 checkpoint 目录。
+
+### `LoadWithOptions(options)`
+
+```go
+model, err := indextts.LoadWithOptions(indextts.LoadOptions{
+    ModelDir:    `E:\models\indextts25-rust`,
+    Device:      indextts.DeviceCUDA,
+    DeviceIndex: 0,
+})
+```
+
+设备常量：
+
+```go
+indextts.DeviceCPU
+indextts.DeviceCUDA
+```
+
+CUDA 需要使用 `cargo build --release -p indextts-ffi --features cuda` 生成的 DLL。CPU DLL 收到 CUDA 设备请求时会明确返回错误，不会静默回退 CPU。
 
 ### `(*Model).PrepareVoice(path)`
 
@@ -666,68 +686,71 @@ $env:ORT_DYLIB_PATH = "$release\onnxruntime.dll"
 .\tts-service.exe
 ```
 
-## 18. GPU 对接现状与后续接口
+## 18. GPU 对接
 
-Rust CLI 已支持并验证：
+CUDA C ABI 构建：
 
-```text
---device cuda --device-index 0
+```powershell
+cargo build --release -p indextts-ffi --features cuda
 ```
 
-但是当前 C ABI 中：
-
-```c
-int32_t device_index; /* 当前默认 -1 = CPU */
-```
-
-Rust FFI 实现会拒绝非 `-1`：
-
-```text
-this build supports CPU only; device_index must be -1
-```
-
-因此当前 Go wrapper 不应宣称 GPU。正式开放 GPU Go API 时建议采用：
+Go 使用：
 
 ```go
-type Device string
-
-const (
-    DeviceCPU  Device = "cpu"
-    DeviceCUDA Device = "cuda"
-    DeviceAuto Device = "auto"
-)
-
-type LoadOptions struct {
-    ModelDir   string
-    Device     Device
-    DeviceIndex int
-}
-
-func LoadWithOptions(options LoadOptions) (*Model, error)
+model, err := indextts.LoadWithOptions(indextts.LoadOptions{
+    ModelDir:    modelDir,
+    Device:      indextts.DeviceCUDA,
+    DeviceIndex: 0,
+})
 ```
 
-同时需要：
+C ABI 设备约定：
 
-1. 给 `indextts-ffi` 增加 `cuda` Cargo feature；
-2. 将 feature 透传给 `indextts-pipeline/cuda`；
-3. `device_index >= 0` 时构造 `DeviceKind::Cuda`；
-4. 构建 CUDA 版 `indextts.dll`；
-5. 将 CUDA、cuDNN、ORT CUDA DLL 放入发布目录；
-6. 增加 Go GPU 集成测试；
-7. 禁止 CUDA provider 静默回退 CPU。
+```c
+int32_t device_index; /* -1 = CPU; >= 0 = CUDA device */
+```
+
+CUDA feature 未启用时请求 GPU会明确失败。CUDA feature 启用后，Candle GPT 与全部 ONNX session 使用指定 GPU。发布目录必须包含 CUDA、cuDNN 和 ORT CUDA DLL；`tools/package_windows_cuda.ps1` 会同时打包 CUDA CLI、CUDA `indextts.dll`、MSVC import library、MinGW/cgo import library和 header。
+
+已验证链路：
+
+```text
+Go test → cgo → indextts.dll → Candle CUDA + ORT CUDA → waveform
+```
+
+实测输出：52,736 samples、22,050 Hz、有限非静音音频。
 
 ## 19. 测试策略
 
 ### Wrapper 编译测试
 
+MinGW cgo 需要 GNU import library。发布脚本会自动生成 `libindextts.dll.a`；手工生成命令：
+
 ```powershell
-$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts"
+Push-Location target\release
+& 'D:\mingw-w64\bin\gendef.exe' indextts.dll
+& 'D:\mingw-w64\bin\dlltool.exe' -d indextts.def -D indextts.dll -l libindextts.dll.a -m i386:x86-64
+Pop-Location
+
+$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts.dll"
 go -C bindings/go test ./...
 ```
 
-### 建议补充的 Go 测试
+### 已有测试与真实 CUDA 集成测试
 
-- `Version()` 非空；
+默认测试不加载大模型；真实测试通过环境变量启用：
+
+```powershell
+$env:INDEXTTS_TEST_MODEL = 'E:\models\indextts25-rust'
+$env:INDEXTTS_TEST_VOICE = 'K:\ComfyUI\models\TTS\IndexTTS-2.5\voices\official-demo\voice_03.wav'
+$env:INDEXTTS_TEST_DEVICE = 'cuda'
+$env:CGO_LDFLAGS = "-L$PWD/target/release -lindextts.dll"
+go -C bindings/go test -v -count=1 ./...
+```
+
+已覆盖 `Version()`、错误设备和真实 CUDA 音频生成。后续仍建议补充：
+
+- 错误模型路径返回错误；
 - 错误模型路径返回错误；
 - 错误 voice 路径返回错误；
 - 真实模型加载；
@@ -795,6 +818,7 @@ type Synthesizer interface {
 [ ] reference WAV 可读取
 [ ] 显式关闭 Voice 和 Model
 [ ] 不并发 Close 与 Generate
-[ ] 当前 Go 接口按 CPU 使用
-[ ] 上线前增加真实模型集成测试
+[ ] 按需求选择 `Load`（CPU）或 `LoadWithOptions`（CUDA）
+[ ] CUDA 发布包含 `libindextts.dll.a`
+[ ] 真实 Go CUDA 集成测试通过
 ```

@@ -25,7 +25,7 @@ typedef struct IndexTtsVoiceHandle *indextts_voice_t;
 
 typedef struct {
     const char *model_dir;
-    int32_t device_index; /* -1 = CPU; CUDA devices are not supported by this build */
+    int32_t device_index; /* -1 = CPU; 0 or greater = CUDA device (CUDA build only) */
     int32_t precision;    /* 0 = float32 */
     uint64_t reserved[8];
 } indextts_model_options_t;

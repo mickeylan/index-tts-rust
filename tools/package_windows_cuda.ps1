@@ -3,6 +3,7 @@ param(
     [string]$CudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8",
     [string]$PythonRoot = "D:\Python3",
     [string]$MsvcCl = "D:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\cl.exe",
+    [string]$MingwBin = "D:\mingw-w64\bin",
     [switch]$SkipBuild,
     [switch]$Zip
 )
@@ -18,6 +19,10 @@ $cu13Bin = Join-Path $sitePackages "nvidia\cu13\bin\x86_64"
 
 $requiredFiles = @(
     @{ Source = (Join-Path $repo "target\release\indextts.exe"); Name = "indextts.exe" },
+    @{ Source = (Join-Path $repo "target\release\indextts.dll"); Name = "indextts.dll" },
+    @{ Source = (Join-Path $repo "target\release\indextts.dll.lib"); Name = "indextts.dll.lib" },
+    @{ Source = (Join-Path $repo "target\release\libindextts.dll.a"); Name = "libindextts.dll.a" },
+    @{ Source = (Join-Path $repo "crates\indextts-ffi\indextts.h"); Name = "indextts.h" },
     @{ Source = (Join-Path $ortBin "onnxruntime.dll"); Name = "onnxruntime.dll" },
     @{ Source = (Join-Path $ortBin "onnxruntime_providers_shared.dll"); Name = "onnxruntime_providers_shared.dll" },
     @{ Source = (Join-Path $ortBin "onnxruntime_providers_cuda.dll"); Name = "onnxruntime_providers_cuda.dll" },
@@ -54,6 +59,22 @@ if (-not $SkipBuild) {
     try {
         cargo build --release -p indextts-cli --features cuda
         if ($LASTEXITCODE -ne 0) { throw "CUDA CLI build failed with exit code $LASTEXITCODE" }
+        cargo build --release -p indextts-ffi --features cuda
+        if ($LASTEXITCODE -ne 0) { throw "CUDA C ABI build failed with exit code $LASTEXITCODE" }
+        $gendef = Join-Path $MingwBin "gendef.exe"
+        $dlltool = Join-Path $MingwBin "dlltool.exe"
+        foreach ($tool in @($gendef, $dlltool)) {
+            if (-not (Test-Path -LiteralPath $tool)) { throw "Required cgo tool not found: $tool" }
+        }
+        Push-Location (Join-Path $repo "target\release")
+        try {
+            & $gendef "indextts.dll"
+            if ($LASTEXITCODE -ne 0) { throw "gendef failed with exit code $LASTEXITCODE" }
+            & $dlltool -d "indextts.def" -D "indextts.dll" -l "libindextts.dll.a" -m "i386:x86-64"
+            if ($LASTEXITCODE -ne 0) { throw "dlltool failed with exit code $LASTEXITCODE" }
+        } finally {
+            Pop-Location
+        }
     } finally {
         Pop-Location
     }

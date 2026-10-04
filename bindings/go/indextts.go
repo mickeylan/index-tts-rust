@@ -23,19 +23,50 @@ func nativeError() error {
 	return errors.New("IndexTTS native call failed")
 }
 
+type Device string
+
+const (
+	DeviceCPU  Device = "cpu"
+	DeviceCUDA Device = "cuda"
+)
+
+type LoadOptions struct {
+	ModelDir    string
+	Device      Device
+	DeviceIndex int
+}
+
 type Model struct {
 	mu sync.Mutex
 	h  C.indextts_model_t
 }
 
 func Load(modelDir string) (*Model, error) {
+	return LoadWithOptions(LoadOptions{ModelDir: modelDir, Device: DeviceCPU})
+}
+
+func LoadWithOptions(loadOptions LoadOptions) (*Model, error) {
 	nativeMu.Lock()
 	defer nativeMu.Unlock()
-	path := C.CString(modelDir)
+	if loadOptions.ModelDir == "" {
+		return nil, errors.New("IndexTTS model directory is empty")
+	}
+	path := C.CString(loadOptions.ModelDir)
 	defer C.free(unsafe.Pointer(path))
 	var options C.indextts_model_options_t
 	C.indextts_model_options_init(&options)
 	options.model_dir = path
+	switch loadOptions.Device {
+	case "", DeviceCPU:
+		options.device_index = -1
+	case DeviceCUDA:
+		if loadOptions.DeviceIndex < 0 {
+			return nil, errors.New("IndexTTS CUDA device index must be non-negative")
+		}
+		options.device_index = C.int32_t(loadOptions.DeviceIndex)
+	default:
+		return nil, errors.New("unsupported IndexTTS device: " + string(loadOptions.Device))
+	}
 	var handle C.indextts_model_t
 	if C.indextts_model_load(&options, &handle) != C.INDEXTTS_OK {
 		return nil, nativeError()
@@ -56,6 +87,7 @@ func (m *Model) Close() error {
 }
 
 type Voice struct {
+	mu    sync.Mutex
 	model *Model
 	h     C.indextts_voice_t
 }
@@ -83,6 +115,8 @@ func (m *Model) PrepareVoice(path string) (*Voice, error) {
 }
 
 func (v *Voice) Close() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if v.h != nil {
 		C.indextts_voice_free(v.h)
 		v.h = nil
@@ -105,8 +139,13 @@ type Audio struct {
 func (m *Model) Generate(v *Voice, text string, options Options) (Audio, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.h == nil || v == nil || v.h == nil {
+	if v == nil {
 		return Audio{}, errors.New("model or voice is closed")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if m.h == nil || v.h == nil || v.model != m {
+		return Audio{}, errors.New("model or voice is closed or mismatched")
 	}
 	if options.Language == "" {
 		options.Language = "ZH"
@@ -131,11 +170,12 @@ func (m *Model) Generate(v *Voice, text string, options Options) (Audio, error) 
 	}
 	nativeMu.Unlock()
 	defer C.indextts_audio_free(&output)
-	samples := C.GoBytes(unsafe.Pointer(output.samples), C.int(output.sample_count*C.size_t(4)))
-	floats := make([]float32, output.sample_count)
-	for i := range floats {
-		floats[i] = *(*float32)(unsafe.Pointer(&samples[i*4]))
+	count := int(output.sample_count)
+	if count < 0 || C.size_t(count) != output.sample_count {
+		return Audio{}, errors.New("native audio is too large for this Go process")
 	}
+	nativeSamples := unsafe.Slice((*float32)(unsafe.Pointer(output.samples)), count)
+	floats := append([]float32(nil), nativeSamples...)
 	runtime.KeepAlive(v)
 	return Audio{Samples: floats, SampleRate: uint32(output.sample_rate), Channels: uint32(output.channels)}, nil
 }

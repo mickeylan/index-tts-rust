@@ -173,9 +173,27 @@ pub unsafe extern "C" fn indextts_model_load(
         let options = &*options;
         validate_reserved(&options.reserved)?;
         let model_dir = required_utf8(options.model_dir, "model_dir")?;
-        if options.device_index != -1 {
-            return Err("this build supports CPU only; device_index must be -1".into());
-        }
+        let device = match options.device_index {
+            -1 => DeviceConfig::new(DeviceKind::Cpu, 0),
+            index if index >= 0 => {
+                #[cfg(feature = "cuda")]
+                {
+                    DeviceConfig::new(DeviceKind::Cuda, index as usize)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(
+                        "CUDA device requested, but indextts was built without the cuda feature"
+                            .into(),
+                    );
+                }
+            }
+            index => {
+                return Err(format!(
+                    "invalid device_index {index}; use -1 for CPU or >= 0 for CUDA"
+                ))
+            }
+        };
         let precision = match options.precision {
             0 => Precision::Float32,
             value => {
@@ -186,7 +204,7 @@ pub unsafe extern "C" fn indextts_model_load(
         };
         let config = ModelConfig {
             model_dir: PathBuf::from(model_dir),
-            device: DeviceConfig::new(DeviceKind::Cpu, 0),
+            device,
             precision,
         };
         let mut pipeline = IndexTtsPipeline::new(config);

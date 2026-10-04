@@ -14,6 +14,10 @@ categories.workspace = true
 name = "indextts"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+default = []
+cuda = ["indextts-pipeline/cuda"]
+
 [dependencies]
 indextts-core = { workspace = true }
 indextts-pipeline = { workspace = true }
