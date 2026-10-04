@@ -38,6 +38,25 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def onnx_contract(path: Path) -> dict:
+    import onnx
+
+    model = onnx.load(str(path), load_external_data=False)
+    def outlet(value) -> dict:
+        tensor = value.type.tensor_type
+        return {
+            "name": value.name,
+            "dtype": tensor.elem_type,
+            "shape": [dimension.dim_value if dimension.HasField("dim_value") else -1
+                      for dimension in tensor.shape.dim],
+        }
+    return {
+        "opsets": {item.domain or "ai.onnx": item.version for item in model.opset_import},
+        "inputs": [outlet(value) for value in model.graph.input],
+        "outputs": [outlet(value) for value in model.graph.output],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_dir", type=Path)
@@ -50,7 +69,10 @@ def main() -> None:
     for relative in REQUIRED:
         path = model_dir / relative
         print(f"hashing {relative}")
-        files[relative] = {"bytes": path.stat().st_size, "sha256": sha256(path)}
+        metadata = {"bytes": path.stat().st_size, "sha256": sha256(path)}
+        if path.suffix.lower() == ".onnx":
+            metadata["onnx"] = onnx_contract(path)
+        files[relative] = metadata
     manifest = {
         "format_version": 1,
         "model": "IndexTTS-2.5",

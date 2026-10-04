@@ -123,6 +123,9 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
             .and_then(Value::as_str)
             .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or_else(|| format!("model manifest entry {relative} has no valid SHA-256"))?;
+        if relative.ends_with(".onnx") {
+            validate_onnx_contract(relative, metadata)?;
+        }
         let path = model_dir.join(relative_path);
         let actual_bytes = path
             .metadata()
@@ -142,6 +145,54 @@ pub fn validate_model_manifest(model_dir: &Path) -> Result<ValidatedManifest, St
         model,
         sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
     })
+}
+
+fn validate_onnx_contract(relative: &str, metadata: &Value) -> Result<(), String> {
+    let contract = metadata
+        .get("onnx")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("model manifest entry {relative} has no ONNX contract"))?;
+    if contract
+        .get("opsets")
+        .and_then(Value::as_object)
+        .and_then(|opsets| opsets.get("ai.onnx"))
+        .and_then(Value::as_u64)
+        != Some(17)
+    {
+        return Err(format!(
+            "model manifest entry {relative} must use ONNX opset 17"
+        ));
+    }
+    for kind in ["inputs", "outputs"] {
+        let outlets = contract
+            .get(kind)
+            .and_then(Value::as_array)
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| format!("model manifest entry {relative} has no ONNX {kind}"))?;
+        for outlet in outlets {
+            let outlet = outlet
+                .as_object()
+                .ok_or_else(|| format!("invalid ONNX {kind} in {relative}"))?;
+            if outlet
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!("unnamed ONNX {kind} in {relative}"));
+            }
+            if !matches!(outlet.get("dtype").and_then(Value::as_u64), Some(1 | 7)) {
+                return Err(format!("unsupported ONNX {kind} dtype in {relative}"));
+            }
+            let shape = outlet
+                .get("shape")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("missing ONNX {kind} shape in {relative}"))?;
+            if shape.is_empty() || shape.iter().any(|dimension| dimension.as_i64().is_none()) {
+                return Err(format!("invalid ONNX {kind} shape in {relative}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn require_manifest_file(
@@ -244,10 +295,15 @@ mod tests {
             let path = directory.path().join(required);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, required.as_bytes()).unwrap();
-            files.insert(
-                (*required).into(),
-                json!({"bytes": required.len(), "sha256": format!("{:x}", Sha256::digest(required.as_bytes()))}),
-            );
+            let mut metadata = json!({"bytes": required.len(), "sha256": format!("{:x}", Sha256::digest(required.as_bytes()))});
+            if required.ends_with(".onnx") {
+                metadata["onnx"] = json!({
+                    "opsets": {"ai.onnx": 17},
+                    "inputs": [{"name": "input", "dtype": 1, "shape": [-1, 1]}],
+                    "outputs": [{"name": "output", "dtype": 1, "shape": [-1, 1]}],
+                });
+            }
+            files.insert((*required).into(), metadata);
         }
         std::fs::write(
             directory.path().join("manifest.json"),

@@ -37,6 +37,25 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def onnx_contract(path: Path) -> dict:
+    import onnx
+
+    model = onnx.load(str(path), load_external_data=False)
+    opsets = {item.domain or "ai.onnx": item.version for item in model.opset_import}
+
+    def outlet(value) -> dict:
+        tensor = value.type.tensor_type
+        shape = [dimension.dim_value if dimension.HasField("dim_value") else -1
+                 for dimension in tensor.shape.dim]
+        return {"name": value.name, "dtype": tensor.elem_type, "shape": shape}
+
+    return {
+        "opsets": opsets,
+        "inputs": [outlet(value) for value in model.graph.input],
+        "outputs": [outlet(value) for value in model.graph.output],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
@@ -80,6 +99,12 @@ def main() -> None:
                 "--output", output / "onnx" / target / f"model-{frames}.onnx")
 
     files = sorted(path for path in output.rglob("*") if path.is_file())
+    file_entries = {}
+    for path in files:
+        metadata = {"bytes": path.stat().st_size, "sha256": sha256(path)}
+        if path.suffix.lower() == ".onnx":
+            metadata["onnx"] = onnx_contract(path)
+        file_entries[path.relative_to(output).as_posix()] = metadata
     manifest = {
         "format_version": 1,
         "model": "IndexTTS-2.5",
@@ -89,7 +114,7 @@ def main() -> None:
         "bigvgan_buckets": bucket_sets["bigvgan"],
         "sample_rate": 22050,
         "semantic": {"start_token": 8192, "stop_token": 8193, "max_tokens": 1815},
-        "files": {path.relative_to(output).as_posix(): {"bytes": path.stat().st_size, "sha256": sha256(path)} for path in files},
+        "files": file_entries,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"wrote package with {len(files)} files to {output}")
