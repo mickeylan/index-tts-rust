@@ -30,5 +30,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [build-dependencies]
 cbindgen = "0.27"

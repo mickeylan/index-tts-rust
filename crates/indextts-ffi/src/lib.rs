@@ -2,6 +2,8 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
+mod manifest;
+
 use indextts_audio::process_reference_audio;
 use indextts_core::{
     AudioBuffer, DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision,
@@ -419,26 +421,10 @@ fn conditioning_bytes(conditioning: &ReferenceConditioning) -> u64 {
     .sum()
 }
 
-fn load_model_info(model_dir: &std::path::Path, device: DeviceConfig) -> ModelInfo {
-    let manifest_path = model_dir.join("manifest.json");
-    let (model_version, manifest_sha256) = std::fs::read(&manifest_path)
-        .ok()
-        .map(|bytes| {
-            let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("model")
-                        .and_then(|item| item.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
-            (version, sha256_hex(&bytes))
-        })
-        .unwrap_or_default();
+fn load_model_info(device: DeviceConfig, manifest: manifest::ValidatedManifest) -> ModelInfo {
     ModelInfo {
-        model_version,
-        manifest_sha256,
+        model_version: manifest.model,
+        manifest_sha256: manifest.sha256,
         device: match device.kind {
             DeviceKind::Cpu => "cpu".into(),
             DeviceKind::Cuda => format!("cuda:{}", device.index),
@@ -628,7 +614,8 @@ pub unsafe extern "C" fn indextts_model_load(
             }
         };
         let model_dir = PathBuf::from(model_dir);
-        let info = load_model_info(&model_dir, device);
+        let manifest = manifest::validate_model_manifest(&model_dir)?;
+        let info = load_model_info(device, manifest);
         let config = ModelConfig {
             model_dir,
             device,
