@@ -39,6 +39,57 @@ type LoadOptions struct {
 	DeviceIndex int
 }
 
+type Capabilities struct {
+	ABIMajor, ABIMinor                                                   uint32
+	SampleRate, MaxReferenceSeconds                                      uint32
+	MaxSemanticTokens, MaxConcurrentRequests                             uint32
+	SupportsCUDA, SupportsCPU                                            bool
+	SupportsCancellation, SupportsRequestCancel                          bool
+	SupportsVoiceCache                                                   bool
+	SupportsEmotionText, SupportsEmotionReference, SupportsEmotionVector bool
+	SupportsTargetDuration, SupportsSampling, SupportsBeamSearch         bool
+}
+
+type ModelInfo struct {
+	RuntimeVersion, ModelVersion, ManifestSHA256 string
+	Backend, Device                              string
+}
+
+type VoiceInfo struct {
+	ReferenceSHA256                  string
+	DurationSeconds                  float32
+	SourceSampleRate, SourceChannels uint32
+	CacheBytes                       uint64
+}
+
+func fixedString(pointer *C.char, length int) string {
+	bytes := unsafe.Slice((*byte)(unsafe.Pointer(pointer)), length)
+	end := 0
+	for end < len(bytes) && bytes[end] != 0 {
+		end++
+	}
+	return string(bytes[:end])
+}
+
+func ABIVersion() uint32 { return uint32(C.indextts_abi_version()) }
+
+func GetCapabilities() (Capabilities, error) {
+	var value C.indextts_capabilities_t
+	if C.indextts_get_capabilities(&value) != C.INDEXTTS_OK {
+		return Capabilities{}, nativeError()
+	}
+	return Capabilities{
+		ABIMajor: uint32(value.abi_major), ABIMinor: uint32(value.abi_minor), SampleRate: uint32(value.sample_rate),
+		MaxReferenceSeconds: uint32(value.max_reference_seconds), MaxSemanticTokens: uint32(value.max_semantic_tokens),
+		MaxConcurrentRequests: uint32(value.max_concurrent_requests_per_model), SupportsCUDA: value.supports_cuda != 0,
+		SupportsCPU: value.supports_cpu != 0, SupportsCancellation: value.supports_cancellation != 0,
+		SupportsRequestCancel: value.supports_request_cancellation != 0, SupportsVoiceCache: value.supports_voice_cache != 0,
+		SupportsEmotionText: value.supports_emotion_text != 0, SupportsEmotionReference: value.supports_emotion_reference != 0,
+		SupportsEmotionVector: value.supports_emotion_vector != 0, SupportsTargetDuration: value.supports_target_duration != 0,
+		SupportsSampling: value.supports_sampling != 0, SupportsBeamSearch: value.supports_beam_search != 0,
+	}, nil
+}
+
 type Model struct {
 	life sync.RWMutex
 	call sync.Mutex
@@ -78,6 +129,23 @@ func LoadWithOptions(loadOptions LoadOptions) (*Model, error) {
 	model := &Model{h: handle}
 	runtime.SetFinalizer(model, (*Model).Close)
 	return model, nil
+}
+
+func (m *Model) Info() (ModelInfo, error) {
+	m.life.RLock()
+	defer m.life.RUnlock()
+	if m.h == nil {
+		return ModelInfo{}, errors.New("IndexTTS model is closed")
+	}
+	var value C.indextts_model_info_t
+	if C.indextts_model_get_info(m.h, &value) != C.INDEXTTS_OK {
+		return ModelInfo{}, nativeError()
+	}
+	return ModelInfo{
+		RuntimeVersion: fixedString(&value.runtime_version[0], 64), ModelVersion: fixedString(&value.model_version[0], 64),
+		ManifestSHA256: fixedString(&value.model_manifest_sha256[0], 65), Backend: fixedString(&value.backend[0], 32),
+		Device: fixedString(&value.device[0], 32),
+	}, nil
 }
 
 func (m *Model) Close() error {
@@ -120,6 +188,23 @@ func (m *Model) PrepareVoice(path string) (*Voice, error) {
 	voice := &Voice{model: m, h: handle}
 	runtime.SetFinalizer(voice, (*Voice).Close)
 	return voice, nil
+}
+
+func (v *Voice) Info() (VoiceInfo, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.h == nil {
+		return VoiceInfo{}, errors.New("IndexTTS voice is closed")
+	}
+	var value C.indextts_voice_info_t
+	if C.indextts_voice_get_info(v.h, &value) != C.INDEXTTS_OK {
+		return VoiceInfo{}, nativeError()
+	}
+	return VoiceInfo{
+		ReferenceSHA256: fixedString(&value.reference_sha256[0], 65), DurationSeconds: float32(value.duration_seconds),
+		SourceSampleRate: uint32(value.source_sample_rate), SourceChannels: uint32(value.source_channels),
+		CacheBytes: uint64(value.cache_bytes),
+	}, nil
 }
 
 func (v *Voice) Close() error {

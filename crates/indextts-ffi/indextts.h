@@ -45,6 +45,45 @@ typedef struct {
 } indextts_generate_options_t;
 
 typedef struct {
+    uint32_t abi_major;
+    uint32_t abi_minor;
+    uint32_t sample_rate;
+    uint32_t max_reference_seconds;
+    uint32_t max_semantic_tokens;
+    uint32_t max_concurrent_requests_per_model;
+    int32_t supports_cuda;
+    int32_t supports_cpu;
+    int32_t supports_cancellation;
+    int32_t supports_request_cancellation;
+    int32_t supports_voice_cache;
+    int32_t supports_emotion_text;
+    int32_t supports_emotion_reference;
+    int32_t supports_emotion_vector;
+    int32_t supports_target_duration;
+    int32_t supports_sampling;
+    int32_t supports_beam_search;
+    uint64_t reserved[8];
+} indextts_capabilities_t;
+
+typedef struct {
+    char runtime_version[64];
+    char model_version[64];
+    char model_manifest_sha256[65];
+    char backend[32];
+    char device[32];
+    uint64_t reserved[8];
+} indextts_model_info_t;
+
+typedef struct {
+    char reference_sha256[65];
+    float duration_seconds;
+    uint32_t source_sample_rate;
+    uint32_t source_channels;
+    uint64_t cache_bytes;
+    uint64_t reserved[8];
+} indextts_voice_info_t;
+
+typedef struct {
     float *samples;
     size_t sample_count;
     uint32_t sample_rate;
@@ -57,6 +96,10 @@ typedef struct {
 #define INDEXTTS_PANIC -2
 #define INDEXTTS_CANCELLED -3
 
+INDEXTTS_API uint32_t indextts_abi_version(void);
+INDEXTTS_API int32_t indextts_get_capabilities(indextts_capabilities_t *capabilities);
+INDEXTTS_API int32_t indextts_model_get_info(indextts_model_t model, indextts_model_info_t *info);
+INDEXTTS_API int32_t indextts_voice_get_info(indextts_voice_t voice, indextts_voice_info_t *info);
 INDEXTTS_API void indextts_model_options_init(indextts_model_options_t *options);
 INDEXTTS_API void indextts_generate_options_init(indextts_generate_options_t *options);
 INDEXTTS_API int32_t indextts_model_load(const indextts_model_options_t *options, indextts_model_t *out_model);

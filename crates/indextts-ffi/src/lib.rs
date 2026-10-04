@@ -6,6 +6,7 @@ use indextts_audio::process_reference_audio;
 use indextts_core::{DeviceConfig, DeviceKind, GenerationConfig, Language, ModelConfig, Precision};
 use indextts_pipeline::IndexTtsPipeline;
 use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -17,9 +18,24 @@ use std::sync::{
 pub struct IndexTtsModelHandle {
     pipeline: IndexTtsPipeline,
     cancelled: Arc<AtomicBool>,
+    info: ModelInfo,
 }
 pub struct IndexTtsVoiceHandle {
     reference_path: PathBuf,
+    info: VoiceInfo,
+}
+
+struct ModelInfo {
+    model_version: String,
+    manifest_sha256: String,
+    device: String,
+}
+
+struct VoiceInfo {
+    reference_sha256: String,
+    duration_seconds: f32,
+    source_sample_rate: u32,
+    source_channels: u32,
 }
 pub type indextts_model_t = *mut IndexTtsModelHandle;
 pub type indextts_voice_t = *mut IndexTtsVoiceHandle;
@@ -98,6 +114,80 @@ impl Default for indextts_audio_out_t {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct indextts_capabilities_t {
+    pub abi_major: u32,
+    pub abi_minor: u32,
+    pub sample_rate: u32,
+    pub max_reference_seconds: u32,
+    pub max_semantic_tokens: u32,
+    pub max_concurrent_requests_per_model: u32,
+    pub supports_cuda: i32,
+    pub supports_cpu: i32,
+    pub supports_cancellation: i32,
+    pub supports_request_cancellation: i32,
+    pub supports_voice_cache: i32,
+    pub supports_emotion_text: i32,
+    pub supports_emotion_reference: i32,
+    pub supports_emotion_vector: i32,
+    pub supports_target_duration: i32,
+    pub supports_sampling: i32,
+    pub supports_beam_search: i32,
+    pub reserved: [u64; 8],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct indextts_model_info_t {
+    pub runtime_version: [libc::c_char; 64],
+    pub model_version: [libc::c_char; 64],
+    pub model_manifest_sha256: [libc::c_char; 65],
+    pub backend: [libc::c_char; 32],
+    pub device: [libc::c_char; 32],
+    pub reserved: [u64; 8],
+}
+
+impl Default for indextts_model_info_t {
+    fn default() -> Self {
+        Self {
+            runtime_version: [0; 64],
+            model_version: [0; 64],
+            model_manifest_sha256: [0; 65],
+            backend: [0; 32],
+            device: [0; 32],
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct indextts_voice_info_t {
+    pub reference_sha256: [libc::c_char; 65],
+    pub duration_seconds: f32,
+    pub source_sample_rate: u32,
+    pub source_channels: u32,
+    pub cache_bytes: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for indextts_voice_info_t {
+    fn default() -> Self {
+        Self {
+            reference_sha256: [0; 65],
+            duration_seconds: 0.0,
+            source_sample_rate: 0,
+            source_channels: 0,
+            cache_bytes: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+const ABI_MAJOR: u32 = 1;
+const ABI_MINOR: u32 = 0;
+
 static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
@@ -150,6 +240,135 @@ fn validate_reserved(values: &[u64]) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn write_c_string<const N: usize>(
+    target: &mut [libc::c_char; N],
+    value: &str,
+) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    if bytes.len() >= N {
+        return Err(format!("value is too long for {N}-byte ABI string"));
+    }
+    target.fill(0);
+    for (slot, byte) in target.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn load_model_info(model_dir: &std::path::Path, device: DeviceConfig) -> ModelInfo {
+    let manifest_path = model_dir.join("manifest.json");
+    let (model_version, manifest_sha256) = std::fs::read(&manifest_path)
+        .ok()
+        .map(|bytes| {
+            let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("model")
+                        .and_then(|item| item.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            (version, sha256_hex(&bytes))
+        })
+        .unwrap_or_default();
+    ModelInfo {
+        model_version,
+        manifest_sha256,
+        device: match device.kind {
+            DeviceKind::Cpu => "cpu".into(),
+            DeviceKind::Cuda => format!("cuda:{}", device.index),
+            DeviceKind::Auto => format!("auto:{}", device.index),
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn indextts_abi_version() -> u32 {
+    (ABI_MAJOR << 16) | ABI_MINOR
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_get_capabilities(
+    capabilities: *mut indextts_capabilities_t,
+) -> i32 {
+    ffi_status(|| {
+        if capabilities.is_null() {
+            return Err("capabilities is required".into());
+        }
+        *capabilities = indextts_capabilities_t {
+            abi_major: ABI_MAJOR,
+            abi_minor: ABI_MINOR,
+            sample_rate: 22_050,
+            max_reference_seconds: 15,
+            max_semantic_tokens: 1815,
+            max_concurrent_requests_per_model: 1,
+            supports_cuda: cfg!(feature = "cuda") as i32,
+            supports_cpu: 1,
+            supports_cancellation: 1,
+            supports_request_cancellation: 0,
+            supports_voice_cache: 0,
+            supports_emotion_text: 0,
+            supports_emotion_reference: 0,
+            supports_emotion_vector: 0,
+            supports_target_duration: 0,
+            supports_sampling: 0,
+            supports_beam_search: 0,
+            reserved: [0; 8],
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_model_get_info(
+    model: indextts_model_t,
+    info: *mut indextts_model_info_t,
+) -> i32 {
+    ffi_status(|| {
+        if model.is_null() || info.is_null() {
+            return Err("invalid arguments".into());
+        }
+        let model = &*model;
+        let mut output = indextts_model_info_t::default();
+        write_c_string(&mut output.runtime_version, env!("CARGO_PKG_VERSION"))?;
+        write_c_string(&mut output.model_version, &model.info.model_version)?;
+        write_c_string(
+            &mut output.model_manifest_sha256,
+            &model.info.manifest_sha256,
+        )?;
+        write_c_string(&mut output.backend, "candle+onnxruntime")?;
+        write_c_string(&mut output.device, &model.info.device)?;
+        *info = output;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn indextts_voice_get_info(
+    voice: indextts_voice_t,
+    info: *mut indextts_voice_info_t,
+) -> i32 {
+    ffi_status(|| {
+        if voice.is_null() || info.is_null() {
+            return Err("invalid arguments".into());
+        }
+        let voice = &*voice;
+        let mut output = indextts_voice_info_t::default();
+        write_c_string(&mut output.reference_sha256, &voice.info.reference_sha256)?;
+        output.duration_seconds = voice.info.duration_seconds;
+        output.source_sample_rate = voice.info.source_sample_rate;
+        output.source_channels = voice.info.source_channels;
+        output.cache_bytes = 0;
+        *info = output;
+        Ok(())
+    })
 }
 
 #[no_mangle]
@@ -211,8 +430,10 @@ pub unsafe extern "C" fn indextts_model_load(
                 ))
             }
         };
+        let model_dir = PathBuf::from(model_dir);
+        let info = load_model_info(&model_dir, device);
         let config = ModelConfig {
-            model_dir: PathBuf::from(model_dir),
+            model_dir,
             device,
             precision,
         };
@@ -221,6 +442,7 @@ pub unsafe extern "C" fn indextts_model_load(
         *out_model = Box::into_raw(Box::new(IndexTtsModelHandle {
             pipeline,
             cancelled: Arc::new(AtomicBool::new(false)),
+            info,
         }));
         Ok(())
     })
@@ -238,9 +460,19 @@ pub unsafe extern "C" fn indextts_voice_prepare(
         }
         *out_voice = std::ptr::null_mut();
         let path = PathBuf::from(required_utf8(reference_audio_path, "reference_audio_path")?);
-        process_reference_audio(&path).map_err(|error| error.to_string())?;
+        let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+        let reader = hound::WavReader::open(&path).map_err(|error| error.to_string())?;
+        let spec = reader.spec();
+        let (_, processed) = process_reference_audio(&path).map_err(|error| error.to_string())?;
+        let info = VoiceInfo {
+            reference_sha256: sha256_hex(&bytes),
+            duration_seconds: processed.duration() as f32,
+            source_sample_rate: spec.sample_rate,
+            source_channels: spec.channels as u32,
+        };
         *out_voice = Box::into_raw(Box::new(IndexTtsVoiceHandle {
             reference_path: path,
+            info,
         }));
         Ok(())
     })
@@ -388,6 +620,20 @@ mod tests {
         assert_eq!(generation.duration_factor, 1.0);
     }
     #[test]
+    fn abi_version_and_capabilities_are_truthful() {
+        assert_eq!(indextts_abi_version(), 0x0001_0000);
+        let mut capabilities = indextts_capabilities_t::default();
+        assert_eq!(unsafe { indextts_get_capabilities(&mut capabilities) }, 0);
+        assert_eq!(capabilities.abi_major, 1);
+        assert_eq!(capabilities.abi_minor, 0);
+        assert_eq!(capabilities.sample_rate, 22_050);
+        assert_eq!(capabilities.max_concurrent_requests_per_model, 1);
+        assert_eq!(capabilities.supports_cuda, cfg!(feature = "cuda") as i32);
+        assert_eq!(capabilities.supports_request_cancellation, 0);
+        assert_eq!(capabilities.supports_voice_cache, 0);
+    }
+
+    #[test]
     fn version_and_error_pointers_are_stable() {
         assert_eq!(
             unsafe { CStr::from_ptr(indextts_version()) }
@@ -407,6 +653,11 @@ mod tests {
         let handle = Box::new(IndexTtsModelHandle {
             pipeline: IndexTtsPipeline::new(ModelConfig::default()),
             cancelled: Arc::new(AtomicBool::new(false)),
+            info: ModelInfo {
+                model_version: String::new(),
+                manifest_sha256: String::new(),
+                device: "cpu".into(),
+            },
         });
         let pointer = Box::into_raw(handle);
         assert_eq!(unsafe { indextts_model_cancel(pointer) }, 0);

@@ -10,6 +10,16 @@ import (
 )
 
 func TestVersion(t *testing.T) {
+	if ABIVersion() != 0x00010000 {
+		t.Fatalf("unexpected ABI version %#x", ABIVersion())
+	}
+	capabilities, err := GetCapabilities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilities.ABIMajor != 1 || capabilities.SampleRate != 22050 || !capabilities.SupportsCPU {
+		t.Fatalf("unexpected capabilities: %+v", capabilities)
+	}
 	if Version() == "" {
 		t.Fatal("native version is empty")
 	}
@@ -41,12 +51,26 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("load model: %v", err)
 	}
 	defer model.Close()
+	modelInfo, err := model.Info()
+	if err != nil {
+		t.Fatalf("model info: %v", err)
+	}
+	if modelInfo.RuntimeVersion == "" || modelInfo.Backend == "" || modelInfo.Device == "" {
+		t.Fatalf("invalid model info: %+v", modelInfo)
+	}
 
 	voice, err := model.PrepareVoice(voicePath)
 	if err != nil {
 		t.Fatalf("prepare voice: %v", err)
 	}
 	defer voice.Close()
+	voiceInfo, err := voice.Info()
+	if err != nil {
+		t.Fatalf("voice info: %v", err)
+	}
+	if len(voiceInfo.ReferenceSHA256) != 64 || voiceInfo.DurationSeconds <= 0 || voiceInfo.SourceSampleRate == 0 {
+		t.Fatalf("invalid voice info: %+v", voiceInfo)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelled := make(chan error, 1)
